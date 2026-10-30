@@ -23,12 +23,15 @@ if(KV_SANITIZE)
 endif()
 
 # ---- Library ----------------------------------------------------------------
-# INTERFACE for now because src/ contains only headers. Once you add a .cpp,
-# change to:  add_library(kv STATIC src/core/<file>.cpp ...)
-# and change INTERFACE below to PUBLIC.
-add_library(kv INTERFACE)
-target_include_directories(kv INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_features(kv INTERFACE cxx_std_20)
+add_library(kv STATIC
+    src/core/memtable.cc
+)
+
+target_include_directories(kv PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_features(kv PUBLIC cxx_std_20)
 
 # ---- Tests ------------------------------------------------------------------
 include(CTest)
