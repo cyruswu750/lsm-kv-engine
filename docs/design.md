@@ -82,7 +82,7 @@ Process termination, malformed-file injection, and device power loss are differe
 
 All integers are unsigned little-endian. Serialize fields explicitly; never dump C++ structs, pointers, padding, or native size_t. There is no record padding or block fragmentation in v1.
 
-File header: 8 bytes magic `KVWAL001`, uint32 version=1, uint32 reserved=0: 16 bytes total. A new header must be written and synced before this WAL accepts mutations. For a new database, the WAL is created through a temporary file: write the 16-byte header to `000001.wal.tmp`, fsync it, rename it to `000001.wal`, then fsync the directory. Without this, a crash during creation could leave a partial header, and because a bad header fails Open, the database could never be opened again. Open ignores and removes leftover `*.tmp` files after acquiring the lock. An existing truncated/bad header fails Open rather than being silently replaced. Later WAL files are published through the manifest before use.
+File header: 8 bytes magic `KVWAL001`, uint32 version=1, uint32 reserved=0: 16 bytes total. A new header must be written and synced before this WAL accepts mutations. For a new database, the WAL is created through a temporary file: write the 16-byte header to `000001.wal.tmp`, fsync it, rename it to `000001.wal`, then fsync the directory. Without this, a crash during creation could leave a partial header, and because a bad header fails Open, the database could never be opened again. For M1, Open recognizes only `000001.wal.tmp` as an initialization temporary file. After acquiring the exclusive lock and validating the directory state, Open may remove this file before completing initialization or opening an existing valid WAL. It must not remove unrelated files merely because their names end in `.tmp`. An existing truncated/bad header fails Open rather than being silently replaced. Later WAL files are published through the manifest before use.
 
 Each record starts with the following 28-byte header:
 
@@ -107,9 +107,15 @@ Example: Put("a", "hi") has key_len=1, value_len=2, type=1 and total size=31 byt
 M1 directory layout:
 - `LOCK`: held with flock(LOCK_EX | LOCK_NB) for the life of the handle; contention returns Busy. Its contents are unused.
 - `000001.wal`: the only WAL in M1. From M2 the manifest names the active WAL.
-- `*.tmp`: never authoritative; ignored and removed by Open after the lock is held.
+- `000001.wal.tmp`: a non-authoritative initialization file. It may be cleaned up only after acquiring the exclusive lock and validating the directory state. Other `.tmp` files are not treated as engine-owned files.
 
-A database exists iff `000001.wal` exists. If the directory does not exist: create_if_missing=false returns NotFound without creating anything; otherwise create it and fsync its parent. If `000001.wal` is absent and the directory contains nothing besides `LOCK` and `*.tmp` files, it is uninitialized (a crash during creation can leave exactly this): create_if_missing=true creates the WAL as described above; false returns NotFound. Any other entry without `000001.wal` returns InvalidArgument and the directory is not initialized.
+For M1, the presence of `000001.wal` indicates an existing database, but Open must still validate its header and records. An invalid final WAL must not be silently replaced.
+
+If the directory does not exist, create_if_missing=false returns NotFound without creating anything; otherwise, Open creates it and fsyncs its parent.
+
+If `000001.wal` is absent and the directory contains only `LOCK`, `000001.wal.tmp`, or neither, it is considered uninitialized. With create_if_missing=true, Open acquires the exclusive lock, removes any leftover `000001.wal.tmp`, and creates the WAL using the publication procedure above. With create_if_missing=false, it returns NotFound without initializing the database or removing the temporary file.
+
+If `000001.wal` is absent and any unrelated entry is present, Open returns InvalidArgument without initializing the database or deleting unrelated files.
 
 ## 7. Recovery rules (M1)
 
