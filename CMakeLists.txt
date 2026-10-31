@@ -25,6 +25,7 @@ endif()
 # ---- Library ----------------------------------------------------------------
 add_library(kv STATIC
     src/core/memtable.cc
+    src/core/db.cc
 )
 
 target_include_directories(kv PUBLIC
