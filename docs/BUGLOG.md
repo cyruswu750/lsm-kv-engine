@@ -9,11 +9,12 @@ No entries yet.
 
 ## B-001: Short title (YYYY-MM-DD)
 
-- Symptom: What went wrong.
-- Reproduction: Test name, seed, or failure-injection point.
-- Root cause: Why it happened.
-- Fix: What changed; link to the fix commit when available.
-- Regression test: Test that prevents the bug from recurring.
-- Status: Open / Fixed.
+- Symptom: What went wrong, with the actual error or wrong output.
+- Found by: Test name, seed, or injection point (link to failure-matrix row).
+- First suspected: What I thought it was, and why that was wrong.
+- Root cause: The actual mechanism.
+- Fix: What changed; commit hash.
+- Regression test: Test name.
+- Lesson: One line.
 
 -->

@@ -3,6 +3,15 @@
 Record decisions that affect correctness, durability, architecture,
 or measurable performance. Update validation status as tests are added.
 
+## D-00X: Title
+Date: YYYY-MM-DD
+
+- Decision:
+- Alternatives: What else was viable, and why rejected.
+- Reason:
+- Cost: What this choice gives up.
+- Validation: Test name (or "Planned: ...").
+
 ## D-001: Publish new WAL files through a temporary file
 Date: 2026-10-28
 
