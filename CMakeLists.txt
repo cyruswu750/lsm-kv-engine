@@ -25,6 +25,7 @@ endif()
 # ---- Library ----------------------------------------------------------------
 add_library(kv STATIC
     src/core/memtable.cc
+    src/core/crc32c.cc
     src/core/db.cc
 )
 
