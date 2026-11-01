@@ -64,7 +64,7 @@ These are interface proposals, not a complete compilable header. Required standa
 
 Use std::map<std::string, Entry, BytewiseLess> initially. Define BytewiseLess as lexicographic unsigned-byte order. Entry owns a value or tombstone and a uint64_t sequence number. std::map supplies an ordered container; implementing a balanced tree is outside this project's purpose.
 
-Sequence numbers begin at 1 and increase for each accepted mutation; reject overflow. They order versions, not keys. Replay is in log order. After M2, next sequence exceeds both the manifest checkpoint and all replayed records. Cross-layer lookup chooses the greatest sequence for a key; a winning tombstone means NotFound. Duplicate identical versions may be tolerated during recovery, but conflicting records with the same sequence are Corruption.
+Sequence numbers begin at 1 and increase for each accepted mutation; reject overflow. They order versions, not keys. Replay is in log order. After M2, next sequence exceeds both the manifest checkpoint and all replayed records. Cross-layer lookup chooses the greatest sequence for a key; a winning tombstone means NotFound. Within one WAL, sequence numbers must be nonzero and strictly increasing; duplicates or decreases are Corruption. Gaps are allowed. Any tolerance for identical versions across WALs and SSTables is an M2 recovery rule, not permission for duplicate records within one WAL. Conflicting versions with the same sequence are Corruption. Early termination is allowed only when ordering invariants prove that no unsearched source can contain a newer version of the same key. Level number alone is not such a proof.
 
 ## 5. Durability contract
 
@@ -74,7 +74,7 @@ write success is not the persistence boundary. Loop for short writes; retry EINT
 
 If Put/Delete returns Ok, recovery must preserve its effect unless a later recovered mutation supersedes it. An operation interrupted before its response, or returning an I/O error after persistence began, has an uncertain outcome: it may survive completely or be absent. It must never produce a partially decoded key/value. An error is not a rollback guarantee.
 
-After WAL append/sync failure return IOError and enter NeedsRecovery. Never retry fsync after it fails: on Linux, dirty pages whose writeback failed may already be marked clean, so a later successful fsync does not prove the data reached storage. The handle enters NeedsRecovery immediately.Subsequent calls return NeedsRecovery. Reopen determines valid on-disk state. Do not continue appending past a failed partial record.
+After WAL append/sync failure return IOError and enter NeedsRecovery. Never retry fsync after it fails: on Linux, dirty pages whose writeback failed may already be marked clean, so a later successful fsync does not prove the data reached storage. The handle enters NeedsRecovery immediately.Subsequent calls return NeedsRecovery. Reopen validates the bytes visible through the filesystem; it does not prove that a prior writeback failure has been repaired. Successful reopen alone does not restore a durability guarantee after a real storage writeback error. Recovery from such failures is outside the baseline guarantee. Do not continue appending past a failed partial record.
 
 Process termination, malformed-file injection, and device power loss are different models. SIGKILL does not clear the OS page cache. Claims are limited to tested failures; WSL2 results also depend on host storage semantics.
 
@@ -120,6 +120,15 @@ If `000001.wal` is absent and any unrelated entry is present, Open returns Inval
 ## 7. Recovery rules (M1)
 
 Acquire exclusive directory lock, validate file header, then scan from byte 16. Keep last_good_offset and last sequence. Before allocation validate header CRC, reserved fields, type, lengths, overflow, and sequence order. Apply an entry only after its full payload passes checksum.
+
+Validate the file header in this order:
+1. Fewer than 16 bytes: Corruption.
+2. Incorrect magic: Corruption.
+3. Unsupported version: UnsupportedFormat.
+4. For version 1, nonzero reserved bytes: Corruption.
+
+The file header has no checksum. A corrupted version field may
+therefore be reported as UnsupportedFormat.
 
 | Observation | Policy |
 |---|---|
@@ -169,7 +178,9 @@ Fault injection uses two distinct mechanisms: an I/O adapter for deterministic s
 
 Maintain a matrix with checkpoint, mechanism, expected result, seed, observed result, and regression test. Cover WAL append/sync/application/response, SST sync/rename, manifest write/sync/rename/directory-sync, obsolete-file removal, and compaction publication. Test old-value resurrection and missing referenced files explicitly. Later-operation coverage must not be mistaken for loss of earlier acknowledged values.
 
-CI runs unit/differential tests with ASan and UBSan. These detect memory/undefined-behavior errors, not proof of crash safety. Parser fuzzing is an optional extension after deterministic tests.
+CI runs unit/differential tests with ASan and UBSan. These detect memory/undefined-behavior errors, not proof of crash safety. Parser fuzzing is an optional extension after deterministic tests. A deterministic crash simulator will maintain separate volatile and durable state. Successful file sync persists file contents and size; successful directory sync persists namespace changes. A simulated crash discards volatile state and reopens from durable state.
+
+This model tests loss of unsynced state; it does not model every possible writeback ordering, torn write, or device failure. Byte-level truncation and corruption tests remain separate. Tests inject I/O behavior through an internal construction path. The public Options type does not expose a filesystem injection hook.
 
 ## 11. Benchmark protocol (M4)
 
