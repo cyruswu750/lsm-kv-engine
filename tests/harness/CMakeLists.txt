@@ -1,5 +1,7 @@
 add_executable(kv_tests
-  smoke_test.cpp)
+  smoke_test.cpp
+  memtable_test.cpp
+  validation_test.cpp)
 target_link_libraries(kv_tests PRIVATE kv GTest::gtest_main)
 
 include(GoogleTest)
