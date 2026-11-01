@@ -3,18 +3,13 @@
 Record significant bugs found during development, especially those
 affecting correctness, recovery, or data integrity.
 
-No entries yet.
+## B-001: DecodeFixed32/64 mis-decode bytes >= 0x80 (2026-10-31)
 
-<!-- Copy this template when adding a bug:
-
-## B-001: Short title (YYYY-MM-DD)
-
-- Symptom: What went wrong, with the actual error or wrong output.
-- Found by: Test name, seed, or injection point (link to failure-matrix row).
-- First suspected: What I thought it was, and why that was wrong.
-- Root cause: The actual mechanism.
-- Fix: What changed; commit hash.
-- Regression test: Test name.
-- Lesson: One line.
-
--->
+- Symptom: DecodeFixed32("\x80\x00\x00\x00") returned 0xFFFFFF80 instead of 0x80;
+  DecodeFixed64 aborted under UBSan ("shift exponent 32 is too large for 32-bit type 'int'").
+- Found by: Coding golden-byte/round-trip tests (32-bit); UBSan (64-bit).
+- Root cause: 32-bit cast signed `char` directly to uint32_t (sign extension);
+  64-bit shifted as `int` before widening (UB for shifts >= 32).
+- Fix: char -> unsigned char -> uintN_t, then shift. Commit 0bfc9cb.
+- Regression test: Coding.DecodeFixed32FromSpecifiedBytes, Coding.DecodeFixed64FromSpecifiedBytes.
+- Lesson: Widen bytes through unsigned char before shifting.
