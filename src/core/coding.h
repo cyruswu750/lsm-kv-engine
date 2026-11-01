@@ -23,18 +23,22 @@ inline void EncodeFixed64(char* dst, std::uint64_t value) {
     }
 }
 
+// Each byte goes through unsigned char before widening so that bytes
+// >= 0x80 are not sign-extended when char is signed.
 inline std::uint32_t DecodeFixed32(const char* src) {
-    return static_cast<std::uint32_t>(src[0])
-        | (static_cast<std::uint32_t>(src[1]) << 8)
-        | (static_cast<std::uint32_t>(src[2]) << 16)
-        | (static_cast<std::uint32_t>(src[3]) << 24);
+    std::uint32_t value = 0;
+    for (int i = 0; i < 4; ++i) {
+        value |= static_cast<std::uint32_t>(static_cast<unsigned char>(src[i]))
+                 << (8 * i);
+    }
+    return value;
 }
 
 inline std::uint64_t DecodeFixed64(const char* src) {
     std::uint64_t value = 0;
-    for (unsigned int i = 0; i < 8; ++i) {
-        const auto byte = static_cast<unsigned char>(src[i]);
-        value |= static_cast<std::uint64_t>(byte << (8 * i));
+    for (int i = 0; i < 8; ++i) {
+        value |= static_cast<std::uint64_t>(static_cast<unsigned char>(src[i]))
+                 << (8 * i);
     }
     return value;
 }
