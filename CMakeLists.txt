@@ -26,6 +26,7 @@ endif()
 add_library(kv STATIC
     src/core/memtable.cc
     src/core/crc32c.cc
+    src/core/wal_codec.cc
     src/core/db.cc
 )
 
