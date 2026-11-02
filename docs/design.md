@@ -11,11 +11,11 @@ The distinguishing deliverables are an executable failure matrix, randomized ref
 ## 2. Scope and milestones
 
 - M1: ordered memtable, versioned checksummed WAL, synchronous Put/Delete, Get, reopen/replay, malformed-input tests, differential tests.
-- M2: immutable SSTables, sparse block index, synchronous flush, manifest publication and WAL retirement.
-- M3: synchronous L0-to-L1 compaction including overlapping L1 tables, Bloom filters, publication failure tests.
-- M4: benchmark ablations, recovery report, documented limitations and README.
+- M2: immutable SSTables, sparse block index, synchronous flush, manifest publication and WAL retirement, publication failure tests.
+- M3: synchronous full-merge compaction, deterministic crash simulation under process-crash and power-loss models, compaction publication failure tests.
+- M4: Bloom filters, benchmark ablations, recovery report, documented limitations and README.
 
-No transactions, snapshots, range API, concurrent calls, background workers, replication, SQL, compression, or network service in the baseline. A directory lock rejects a second opener. Later work must not obscure correctness of M1. If leveled compaction exceeds the budget, explicitly revise the design to full-SST merging; do not label that implementation leveled compaction.
+No transactions, snapshots, range API, concurrent calls, background workers, replication, SQL, compression, or network service in the baseline. A directory lock rejects a second opener. Later work must not obscure correctness of M1. Compaction merges all live SSTs (§9); leveled compaction is out of scope and must not be claimed.
 
 ## 3. Public API (C++20 declarations)
 
@@ -74,7 +74,7 @@ write success is not the persistence boundary. Loop for short writes; retry EINT
 
 If Put/Delete returns Ok, recovery must preserve its effect unless a later recovered mutation supersedes it. An operation interrupted before its response, or returning an I/O error after persistence began, has an uncertain outcome: it may survive completely or be absent. It must never produce a partially decoded key/value. An error is not a rollback guarantee.
 
-After WAL append/sync failure return IOError and enter NeedsRecovery. Never retry fsync after it fails: on Linux, dirty pages whose writeback failed may already be marked clean, so a later successful fsync does not prove the data reached storage. The handle enters NeedsRecovery immediately.Subsequent calls return NeedsRecovery. Reopen validates the bytes visible through the filesystem; it does not prove that a prior writeback failure has been repaired. Successful reopen alone does not restore a durability guarantee after a real storage writeback error. Recovery from such failures is outside the baseline guarantee. Do not continue appending past a failed partial record.
+After WAL append/sync failure return IOError and enter NeedsRecovery. Never retry fsync after it fails: on Linux, dirty pages whose writeback failed may already be marked clean, so a later successful fsync does not prove the data reached storage. The handle enters NeedsRecovery immediately. Subsequent calls return NeedsRecovery. Reopen validates the bytes visible through the filesystem; it does not prove that a prior writeback failure has been repaired. Successful reopen alone does not restore a durability guarantee after a real storage writeback error. Recovery from such failures is outside the baseline guarantee. Do not continue appending past a failed partial record.
 
 Process termination, malformed-file injection, and device power loss are different models. SIGKILL does not clear the OS page cache. Claims are limited to tested failures; WSL2 results also depend on host storage semantics.
 
@@ -147,9 +147,9 @@ Tail truncation assumes an interrupted append, not arbitrary deletion of previou
 
 Flush creates an immutable sorted table containing key, sequence, type, and value. Proposed table components: checksummed data blocks, sparse index mapping block boundary keys to offset/length, versioned footer locating the index and optional Bloom filter. A separate format spec with exact byte offsets and corruption rules is required before implementing SSTables; this document does not pretend those bytes are already settled.
 
-Use synchronous flush before the next mutation when the soft threshold has been exceeded. This avoids returning an ambiguous flush error for a mutation already acknowledged. Reads remain available between calls; no background tasks. Replay may temporarily exceed the threshold in M1; bounded-memory recovery is later work.
+Use synchronous flush before the next mutation when the soft threshold has been exceeded. This avoids returning an ambiguous flush error for a mutation already acknowledged. Reads remain available between calls; no background tasks. Replay may temporarily exceed the threshold; bounded-memory recovery is out of scope.
 
-The manifest is the authoritative snapshot of live SST IDs/levels, WAL IDs, active WAL, checkpoint sequence, format version, and generation. It requires a versioned, checksummed encoding and validation before use. Directory listing alone does not decide which files are live.
+The manifest is the authoritative snapshot of live SST IDs with their sequence ranges, the active WAL ID, checkpoint sequence, next file ID, format version, and generation. It requires a versioned, checksummed encoding and validation before use. Directory listing alone does not decide which files are live. A directory in the M1 layout (WAL without MANIFEST) is UnsupportedFormat; there is no migration.
 
 Publication protocol (one foreground operation at a time):
 1. Keep the previous manifest and its referenced files intact.
@@ -158,15 +158,15 @@ Publication protocol (one foreground operation at a time):
 4. Rename over MANIFEST and fsync the directory. Until this completes, do not acknowledge new operations using the new generation.
 5. Switch in-memory state; retire the previous WAL only after the new manifest is durable. Remove obsolete files and sync the directory for persistent cleanup.
 
-On failure after publication begins, invalidate the handle and reopen. Recovery accepts the old or new published state under the filesystem model; both must have their dependencies intact. Missing/corrupt referenced files cause failure. Unreferenced files are ignored, then cleaned only after a valid manifest is established. Never delete old files before publication. File IDs are never reused, including IDs occupied by orphan files.
+On failure after publication begins, invalidate the handle and reopen. Recovery accepts the old or new published state under the filesystem model; both must have their dependencies intact. Missing/corrupt referenced files cause failure. Unreferenced files are ignored, then cleaned only after a valid manifest is established; a failed cleanup removal is not fatal. Never delete old files before publication. File IDs are never reused, including IDs occupied by orphan files.
 
-## 9. Compaction and Bloom filters (M3)
+## 9. Compaction (M3) and Bloom filters (M4)
 
-L0 tables may overlap. L1 tables are disjoint by key range. Compact selected L0 inputs plus all overlapping L1 inputs, expanding the input set if range closure requires it. Merge by key and descending sequence, keeping the newest version per key. Publish outputs and retire inputs through the same manifest protocol. Selection/overlap and output-boundary rules need dedicated tests before enabling compaction.
+All SSTs form one level, ordered by sequence range. Before the next mutation, after any pending flush, compaction runs synchronously when the live SST count reaches an internal threshold. It merges all live SSTs and keeps, per key, the version with the greatest sequence. Because every older version of every key is in the input set and the memtable and WAL hold only newer sequences, compaction drops shadowed versions and drops a winning tombstone together with its key. The output is at most one SST; if nothing survives, the new manifest lists no SST. Publish through the same manifest protocol; the active WAL and checkpoint are unchanged. Delete inputs only after the new manifest is durable.
 
-Keep tombstones unless the compaction covers every possible older version of that key. Initially retaining all tombstones is acceptable. Dropping one just because its own input lacks an older value is incorrect: an unselected file may resurrect that value. No snapshots means old versions may be dropped once this coverage condition is proved.
+This trades higher write amplification (each compaction rewrites all live data) for a simple coverage proof and bounded read probes. Measure that cost (§11). Partial compaction must keep tombstones: dropping one because its own inputs lack an older value is incorrect, since an unselected file may resurrect that value.
 
-Bloom filters summarize all keys present in an SST, including tombstones. Negative means skip that SST; positive means inspect it, not that the key exists. False positives are allowed, false negatives are not. Version the stable hash/encoding; never rely on unspecified std::hash persistence. Corrupt filter metadata must cause a validated fallback to ordinary lookup or an explicit error, never an unchecked negative.
+Bloom filters summarize all keys present in an SST, including tombstones. Negative means skip that SST; positive means inspect it, not that the key exists. False positives are allowed, false negatives are not. Version the stable hash/encoding in the SST format spec; never rely on unspecified std::hash persistence. The filter block is checksummed; corrupt filter metadata fails SST open with Corruption, never an unchecked negative.
 
 ## 10. Verification and evidence
 
@@ -174,38 +174,31 @@ Differential tests: deterministic seeds, operation traces with Put/Get/Delete/ov
 
 WAL tests: truncate at every byte of selected record streams; mutate header/payload fields; assert the policy above. Test huge lengths, invalid type, sequence overflow/order, duplicate semantics, repair-and-append, short reads/writes, EINTR, ENOSPC/EIO, and sync failure. A crafted corrupted input must never trigger unbounded allocation.
 
-Fault injection uses two distinct mechanisms: an I/O adapter for deterministic short writes/errors and subprocess termination at named checkpoints. Parent process records operation responses; a durable operation may exist before its response is observed. Recovery oracle accepts an ordered prefix containing all observed successes and optionally the in-flight operation; it does not require recovered state to equal only the acknowledged map. Repeated writes/deletes are judged by final ordered effects.
+Fault injection uses two mechanisms through the internal syscall seam: an adapter for deterministic short writes and errors, and a deterministic crash simulator. The simulator can crash after any call that changes file-system state; each crash point is checked under a process-crash model (all completed writes survive) and a power-loss model (only synced state survives). The test driver records operation responses; a durable operation may exist before its response is observed. Recovery oracle accepts an ordered prefix containing all observed successes and optionally the in-flight operation; it does not require recovered state to equal only the acknowledged map. Repeated writes/deletes are judged by final ordered effects.
 
 Maintain a matrix with checkpoint, mechanism, expected result, seed, observed result, and regression test. Cover WAL append/sync/application/response, SST sync/rename, manifest write/sync/rename/directory-sync, obsolete-file removal, and compaction publication. Test old-value resurrection and missing referenced files explicitly. Later-operation coverage must not be mistaken for loss of earlier acknowledged values.
 
-CI runs unit/differential tests with ASan and UBSan. These detect memory/undefined-behavior errors, not proof of crash safety. Parser fuzzing is an optional extension after deterministic tests. A deterministic crash simulator will maintain separate volatile and durable state. Successful file sync persists file contents and size; successful directory sync persists namespace changes. A simulated crash discards volatile state and reopens from durable state.
+CI runs unit/differential tests with ASan and UBSan. These detect memory/undefined-behavior errors, not proof of crash safety. The crash simulator maintains separate volatile and durable state. Successful file sync persists file contents and size; successful directory sync persists namespace changes. A simulated power-loss crash discards volatile state and reopens from durable state. A mutation check removes one required sync and confirms the power-loss model reports a failure.
 
 This model tests loss of unsynced state; it does not model every possible writeback ordering, torn write, or device failure. Byte-level truncation and corruption tests remain separate. Tests inject I/O behavior through an internal construction path. The public Options type does not expose a filesystem injection hook.
 
 ## 11. Benchmark protocol (M4)
 
-Record commit, compiler/build flags, CPU/RAM/storage, filesystem, WSL2/host details, key/value sizes, dataset size, operation count, seed, workload distribution, cache procedure, repetitions, and persistence mode. Use release builds without sanitizers for timing; correctness checks remain separate.
+Record commit, build flags, CPU/RAM/storage, filesystem, WSL2 details, key/value sizes, dataset size, operation count, seed, and persistence mode. Use release builds without sanitizers for timing; correctness checks remain separate.
 
-Report ops/s and per-operation p50/p99 for inserts, overwrites, existing-key reads, missing-key reads, and mixed workloads. Include flush/compaction stalls in end-to-end latency. Use multiple trials and report spread; do not select only the best run.
+Report ops/s and per-operation p50/p99 for inserts, existing-key reads, and missing-key reads. Include flush/compaction stalls in end-to-end latency. Run three trials and report median and range; do not select only the best run. Measurements are warm-cache; no cold-cache claims.
 
-Ablations: Bloom on/off with identical SST data and lookup trace; before/after compaction with identical logical contents. Count SST probes, data-block reads, and bytes requested. These are not necessarily physical device reads because OS caching exists. Do not claim cold cache unless the cache-control procedure is verified.
+Ablations:
+- Durability cost: the same insert workload with fsync disabled through the internal construction path, labeled unsafe and used only for measurement.
+- Bloom on/off with identical SST data and missing-key lookup trace: SST probes, data-block reads, and bytes requested per lookup. These are not necessarily physical device reads because OS caching exists.
+- Compaction threshold sweep, including no compaction: write amplification, total database bytes, SST probes per read, and insert p99.
 
-Write amplification = (WAL bytes + flush SST bytes + compaction SST bytes) / successful user mutation bytes, with user bytes defined as key+value for Put and key for Delete. Exclude empty-byte-only workloads from this ratio; report metadata bytes separately. Space measurement reports total database bytes and live key/value bytes, including WAL/tombstone contribution explicitly. Never compare an unsynced competitor against this synchronous baseline without labeling durability differences.
+Write amplification = (WAL bytes + flush SST bytes + compaction SST bytes) / successful user mutation bytes, with user bytes defined as key+value for Put and key for Delete. Exclude empty-byte-only workloads from this ratio. Never compare an unsynced competitor against this synchronous baseline without labeling durability differences.
 
 Results start as pending. Each optimization must include a hypothesis, measurement, and explanation of its cost, including disappointing results.
 
-## 12. Decision log and attribution
-
-Initial decisions: std::map reduces unrelated container work; synchronous WAL gives a clear success boundary; separate header/payload CRCs prevent blindly trusting lengths; strict checksum failure prioritizes detectable corruption over availability; foreground maintenance makes publication auditable at the cost of latency spikes.
-
-For subsequent decisions record alternatives, chosen policy, reason, verifying test, and measured consequence. Record real bugs and fixes rather than retroactively inventing a development story. AI may assist build/test scaffolding and review; the owner implements and understands core storage modules under the project plan. This design draft was AI-assisted and must be reviewed by the owner before adoption. Implementation status is tracked separately.
-
-References (design background, not claims of format compatibility):
+References:
 - LevelDB implementation: https://github.com/google/leveldb/blob/main/doc/impl.md
 - LevelDB WAL format: https://github.com/google/leveldb/blob/main/doc/log_format.md
 - Linux fsync: https://man7.org/linux/man-pages/man2/fsync.2.html
 - Linux write: https://man7.org/linux/man-pages/man2/write.2.html
-
-## 13. Immediate acceptance gate
-
-Before writing M1, the owner can explain: empty value versus deletion; why write is not fsync; why a failed mutation may survive; how a record boundary is located; why a bad CRC differs from an incomplete tail; and why a repaired tail must be truncated before append. Implement only API types and memtable next, then codec, then WAL/recovery. Do not ask an agent to generate the entire engine from this document.
