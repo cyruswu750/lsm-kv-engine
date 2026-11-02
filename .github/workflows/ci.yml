@@ -11,9 +11,10 @@ jobs:
     env:
       ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-      # Required M1 differential load: 20 seeds (registered test instances)
-      # x 5000 operations, reopening every 500 operations. Pinned here so a
-      # change to the in-code defaults cannot silently shrink the CI run.
+      # Required differential load for every workload, including the M2
+      # flush workloads: 20 seeds (registered test instances) x 5000
+      # operations, reopening every 500 operations. Pinned here so a change
+      # to the in-code defaults cannot silently shrink the CI run.
       KV_DIFF_FIRST_SEED: "1"
       KV_DIFF_OPS: "5000"
       KV_DIFF_REOPEN_EVERY: "500"
