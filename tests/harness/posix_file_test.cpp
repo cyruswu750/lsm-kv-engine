@@ -236,6 +236,56 @@ TEST_F(PosixFileTest, NonEmptyOutputIsRejectedWithoutOpening) {
     EXPECT_EQ(file.get(), original);
 }
 
+// Returns dir / (prefix + NUL + suffix). The name is built with an explicit
+// length so the NUL and suffix survive, and the result is checked so the
+// test cannot silently degrade to the truncated prefix path.
+fs::path PathWithEmbeddedNul(const fs::path& dir,
+                             const std::string& prefix,
+                             const std::string& suffix) {
+    const std::string name = prefix + std::string(1, '\0') + suffix;
+    const fs::path path = dir / name;
+
+    const std::string& native = path.native();
+    const std::size_t nul_pos = dir.native().size() + 1 + prefix.size();
+    EXPECT_EQ(name.size(), prefix.size() + 1 + suffix.size());
+    EXPECT_EQ(native.size(), nul_pos + 1 + suffix.size());
+    EXPECT_EQ(native.find('\0'), nul_pos);
+    EXPECT_EQ(native.substr(nul_pos + 1), suffix);
+    return path;
+}
+
+TEST_F(PosixFileTest, CreateNewRejectsEmbeddedNulPath) {
+    const fs::path prefix = Path("abc");
+    ASSERT_FALSE(fs::exists(prefix));
+    const fs::path path = PathWithEmbeddedNul(dir_, "abc", "suffix");
+    ASSERT_FALSE(HasFailure()) << "NUL path was not constructed as intended";
+
+    std::unique_ptr<WritableFile> file;
+    Status s = NewWritableFile(path, file);
+    EXPECT_EQ(s.code, Code::InvalidArgument) << s.ToString();
+    EXPECT_EQ(file, nullptr);
+    EXPECT_FALSE(fs::exists(prefix));
+
+    // If a handle was returned anyway, release it without writing.
+    file.reset();
+}
+
+TEST_F(PosixFileTest, OpenAppendableRejectsEmbeddedNulPath) {
+    const fs::path prefix = Path("abc");
+    WriteFileDirectly(prefix, kBinary);
+    const fs::path path = PathWithEmbeddedNul(dir_, "abc", "suffix");
+    ASSERT_FALSE(HasFailure()) << "NUL path was not constructed as intended";
+
+    std::unique_ptr<WritableFile> file;
+    Status s = OpenAppendableFile(path, file);
+    EXPECT_EQ(s.code, Code::InvalidArgument) << s.ToString();
+    EXPECT_EQ(file, nullptr);
+
+    // If a handle was returned anyway, release it without writing.
+    file.reset();
+    EXPECT_EQ(ReadFile(prefix), kBinary);
+}
+
 TEST_F(PosixFileTest, EmptyAppendSucceedsWithoutWriting) {
     ScriptedSyscalls sys;
     const fs::path path = Path("data");
