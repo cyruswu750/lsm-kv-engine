@@ -15,6 +15,7 @@
 #include "core/db.h"
 #include "core/memtable.h"
 #include "core/types.h"
+#include "testing/manifest_builder.h"
 #include "testing/temp_dir.h"
 
 namespace kv {
@@ -35,8 +36,13 @@ namespace fs = std::filesystem;
 // operation index, and the last operations, and writes the full trace up to
 // the failing operation to a file in the working directory. No automatic
 // trace minimization is performed.
+//
+// The DbFlush* workloads use a 4 KiB memtable so that flushes, SST
+// lookups, and manifest publication happen throughout the run, and they
+// assert from the published MANIFEST that many flushes actually occurred.
 
 constexpr int kSeedsPerRun = 20;
+constexpr std::size_t kSmallMemtableBytes = 4096;
 
 std::uint64_t EnvOr(const char* name, std::uint64_t fallback) {
     const char* text = std::getenv(name);
@@ -55,6 +61,9 @@ std::uint64_t EnvOr(const char* name, std::uint64_t fallback) {
 std::uint64_t FirstSeed() { return EnvOr("KV_DIFF_FIRST_SEED", 1); }
 std::uint64_t OpCount() { return EnvOr("KV_DIFF_OPS", 5000); }
 std::uint64_t ReopenEvery() { return EnvOr("KV_DIFF_REOPEN_EVERY", 500); }
+// A deliberately loose lower bound, scaled with KV_DIFF_OPS (10 at the
+// pinned 5000 operations); actual counts are recorded per seed.
+std::uint64_t MinFlushesPerSeed() { return OpCount() / 500; }
 
 // SplitMix64: fully specified, so a seed yields the same operations with
 // any compiler or standard library.
@@ -234,7 +243,10 @@ protected:
         return FirstSeed() + static_cast<std::uint64_t>(GetParam());
     }
 
-    void RunDb(const std::string& workload, std::uint64_t reopen_every);
+    void RunDb(const std::string& workload,
+               std::uint64_t reopen_every,
+               std::size_t memtable_bytes = Options{}.memtable_bytes,
+               std::uint64_t min_flushes = 0);
 
     test::TempDir tmp_;
 };
@@ -281,14 +293,18 @@ TEST_P(DifferentialTest, Memtable) {
 }
 
 void DifferentialTest::RunDb(const std::string& workload,
-                             std::uint64_t reopen_every) {
+                             std::uint64_t reopen_every,
+                             std::size_t memtable_bytes,
+                             std::uint64_t min_flushes) {
     Rng rng(Seed());
     Trace trace(workload, Seed());
     const fs::path dir = tmp_.path() / "db";
     std::map<std::string, std::string> model;
+    Options options;
+    options.memtable_bytes = memtable_bytes;
 
     std::unique_ptr<DB> db;
-    ASSERT_TRUE(DB::Open(dir, Options{}, db).ok());
+    ASSERT_TRUE(DB::Open(dir, options, db).ok());
     std::uint64_t reopens = 0;
 
     // Compares every known key, including deleted and never-written ones.
@@ -322,7 +338,7 @@ void DifferentialTest::RunDb(const std::string& workload,
         trace.Add("REOPEN after op " + std::to_string(index));
         ++reopens;
         db.reset();
-        const Status s = DB::Open(dir, Options{}, db);
+        const Status s = DB::Open(dir, options, db);
         if (!s.ok()) {
             return trace.Fail(index, "reopen failed: " + s.ToString());
         }
@@ -380,9 +396,29 @@ void DifferentialTest::RunDb(const std::string& workload,
     const std::uint64_t periodic =
         reopen_every == 0 ? 0 : OpCount() / reopen_every;
     EXPECT_EQ(reopens, periodic + 1);
+
+    // Evidence of flushes, read with the test-side manifest parser. Each
+    // flush publishes one generation and adds one SST; M2 never removes
+    // an SST, so the counts must agree.
+    test::RawManifest manifest;
+    ASSERT_TRUE(test::ReadManifest(dir, manifest));
+    const std::uint64_t flushes = manifest.generation - 1;
+    std::uint64_t sst_files = 0;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (entry.path().extension() == ".sst") {
+            ++sst_files;
+        }
+    }
+    EXPECT_EQ(manifest.ssts.size(), flushes);
+    EXPECT_EQ(sst_files, flushes);
+    EXPECT_GE(flushes, min_flushes) << "workload=" << workload
+                                    << " seed=" << Seed();
     RecordProperty("seed", std::to_string(Seed()));
     RecordProperty("ops", std::to_string(OpCount()));
     RecordProperty("reopens", std::to_string(reopens));
+    RecordProperty("flushes", std::to_string(flushes));
+    // Where the data lived, so a run can show which filesystem it used.
+    RecordProperty("db_dir", dir.string());
 }
 
 TEST_P(DifferentialTest, DbWithoutReopen) {
@@ -391,6 +427,15 @@ TEST_P(DifferentialTest, DbWithoutReopen) {
 
 TEST_P(DifferentialTest, DbPeriodicReopen) {
     RunDb("DbPeriodicReopen", ReopenEvery());
+}
+
+TEST_P(DifferentialTest, DbFlushWithoutReopen) {
+    RunDb("DbFlushWithoutReopen", 0, kSmallMemtableBytes, MinFlushesPerSeed());
+}
+
+TEST_P(DifferentialTest, DbFlushPeriodicReopen) {
+    RunDb("DbFlushPeriodicReopen", ReopenEvery(), kSmallMemtableBytes,
+          MinFlushesPerSeed());
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, DifferentialTest,
