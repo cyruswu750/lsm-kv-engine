@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <vector>
 
 #include "core/posix_file.h"
+#include "testing/fault_syscalls.h"
 
 namespace kv {
 namespace {
@@ -948,6 +950,82 @@ TEST_F(PosixFileTest, TruncateThenAppendHasNoGap) {
     EXPECT_EQ(out, expected);
     EXPECT_EQ(ReadFile(path), expected);  // independent iostream read
     EXPECT_EQ(fs::file_size(path), expected.size());
+}
+
+// ---- RandomAccessFile ---------------------------------------------------------
+
+// Read loops until exactly n bytes arrive: a short pread advances the
+// offset and continues, EINTR is retried, and only end of file or another
+// error is reported (as IOError).
+TEST_F(PosixFileTest, RandomAccessReadRetriesShortReadsAndEintr) {
+    const fs::path path = Path("ra");
+    WriteFileDirectly(path, "0123456789abcdef");
+    test::FaultSyscalls sys;
+    std::unique_ptr<RandomAccessFile> file;
+    ASSERT_TRUE(RandomAccessFile::Open(path, sys, file).ok());
+    EXPECT_EQ(file->size(), 16u);
+
+    sys.armed = true;
+    sys.pread_script = {test::FaultSyscalls::Short(1),
+                        test::FaultSyscalls::Error(EINTR),
+                        test::FaultSyscalls::Short(2),
+                        test::FaultSyscalls::Error(EINTR)};
+    std::string out(10, '\0');
+    const Status s = file->Read(3, out.size(), out.data());
+    ASSERT_TRUE(s.ok()) << s.ToString();
+    EXPECT_EQ(out, "3456789abc");
+    EXPECT_TRUE(sys.pread_script.empty());
+    EXPECT_EQ(sys.preads, 5u);  // 1 + EINTR + 2 + EINTR + remaining 7
+
+    std::string none;
+    EXPECT_TRUE(file->Read(16, 0, none.data()).ok());
+}
+
+TEST_F(PosixFileTest, RandomAccessReadReportsEofAndErrorsWithoutRetry) {
+    const fs::path path = Path("ra");
+    WriteFileDirectly(path, "0123456789abcdef");
+    test::FaultSyscalls sys;
+    std::unique_ptr<RandomAccessFile> file;
+    ASSERT_TRUE(RandomAccessFile::Open(path, sys, file).ok());
+    sys.armed = true;
+
+    std::string out(10, '\0');
+    Status s = file->Read(10, out.size(), out.data());  // only 6 bytes left
+    EXPECT_EQ(s.code, Code::IOError) << s.ToString();
+    EXPECT_NE(s.message.find("unexpected end of file at offset 16"),
+              std::string::npos) << s.message;
+
+    for (int err : {EIO, ENOSPC}) {
+        const std::size_t before = sys.preads;
+        sys.pread_script = {test::FaultSyscalls::Error(err)};
+        s = file->Read(0, out.size(), out.data());
+        EXPECT_EQ(s.code, Code::IOError) << s.ToString();
+        EXPECT_NE(s.message.find(ErrnoText(err)), std::string::npos);
+        EXPECT_EQ(sys.preads, before + 1);  // not retried
+    }
+
+    s = file->Read(std::numeric_limits<std::uint64_t>::max(), 1, out.data());
+    EXPECT_EQ(s.code, Code::IOError) << s.ToString();
+
+    ASSERT_TRUE(file->Close().ok());
+    EXPECT_EQ(sys.closes, 1u);
+    EXPECT_TRUE(file->Close().ok());  // repeated Close has no effect
+    EXPECT_EQ(sys.closes, 1u);
+    EXPECT_EQ(file->Read(0, 1, out.data()).code, Code::IOError);
+}
+
+TEST_F(PosixFileTest, RandomAccessOpenRejectsNonRegularWithoutBlocking) {
+    WriteFileDirectly(Path("target"), "x");
+    fs::create_symlink(Path("target"), Path("link"));
+    fs::create_directory(Path("dir"));
+    ASSERT_EQ(::mkfifo(Path("fifo").c_str(), 0600), 0) << ErrnoText(errno);
+    for (const char* name : {"link", "dir", "fifo", "missing"}) {
+        std::unique_ptr<RandomAccessFile> file;
+        const Status s =
+            RandomAccessFile::Open(Path(name), DefaultPosixSyscalls(), file);
+        EXPECT_EQ(s.code, Code::IOError) << name << ": " << s.ToString();
+        EXPECT_EQ(file, nullptr) << name;
+    }
 }
 
 }  // namespace
