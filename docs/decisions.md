@@ -3,17 +3,7 @@
 Record decisions that affect correctness, durability, architecture,
 or measurable performance. Update validation status as tests are added.
 
-## D-00X: Title
-Date: YYYY-MM-DD
-
-- Decision:
-- Alternatives: What else was viable, and why rejected.
-- Reason:
-- Cost: What this choice gives up.
-- Validation: Test name (or "Planned: ...").
-
 ## D-001: Publish new WAL files through a temporary file
-Date: 2026-10-28
 
 - Decision: Write the header to `000001.wal.tmp`, fsync the file,
   rename it to `000001.wal`, then fsync the database directory.
@@ -30,7 +20,6 @@ Date: 2026-10-28
   termination at named checkpoints; these tests do not model power loss.
 
 ## D-002: Require recovery after a WAL sync failure
-Date: 2026-10-28
 
 - Decision: On a WAL sync failure, return `IOError` and move the
   database handle to `NeedsRecovery`. Do not retry and treat a later
@@ -46,7 +35,6 @@ Date: 2026-10-28
   recovers the prior state, optionally including the failed operation.
 
 ## D-003: Recognize interrupted initialization
-Date: 2026-10-28
 
 - Decision: For M1, a directory containing only `LOCK` and the
   recognized initialization file `000001.wal.tmp` may be initialized
@@ -63,7 +51,6 @@ Date: 2026-10-28
   same process only; a cross-process opener is not yet tested.
 
 ## D-004: Inject DB-level faults through an internal syscall seam
-Date: 2026-11-01
 
 - Decision: `DBOpener::Open` (`src/core/db_internal.h`) has the same
   contract as `DB::Open` but takes a `PosixSyscalls&`. Its virtual
@@ -83,7 +70,6 @@ Date: 2026-11-01
 - Validation: `DBFaultTest.*` and `TornTail.*`.
 
 ## D-005: Classify database entries with lstat and scan twice
-Date: 2026-11-01
 
 - Decision: Entry kinds come from `lstat`; symbolic links are never
   followed. A database path that is a symlink, a file, or another
@@ -112,7 +98,6 @@ Date: 2026-11-01
   `DBTest.MissingParentIsNotCreated`.
 
 ## D-006: Report sequence exhaustion as InvalidArgument before I/O
-Date: 2026-11-01
 
 - Decision: A recovered sequence of `UINT64_MAX` is valid. A later
   Put/Delete returns `InvalidArgument` before encoding or I/O, and the
@@ -128,7 +113,6 @@ Date: 2026-11-01
   `DBTest.PutCanUseMaxSequenceOnce`.
 
 ## D-007: Read the whole WAL into memory during M1 recovery
-Date: 2026-11-01
 
 - Decision: Recovery reads the complete WAL with `ReadFileToString`,
   then decodes records from that buffer.

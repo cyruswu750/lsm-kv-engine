@@ -3,7 +3,7 @@
 Record significant bugs found during development, especially those
 affecting correctness, recovery, or data integrity.
 
-## B-001: DecodeFixed32/64 mis-decode bytes >= 0x80 (2026-10-31)
+## B-001: DecodeFixed32/64 mis-decode bytes >= 0x80
 
 - Symptom: DecodeFixed32("\x80\x00\x00\x00") returned 0xFFFFFF80 instead of 0x80;
   DecodeFixed64 aborted under UBSan ("shift exponent 32 is too large for 32-bit type 'int'").
@@ -13,7 +13,7 @@ affecting correctness, recovery, or data integrity.
 - Fix: char -> unsigned char -> uintN_t, then shift. Commit 0bfc9cb.
 - Regression test: Coding.DecodeFixed32FromSpecifiedBytes, Coding.DecodeFixed64FromSpecifiedBytes.
 
-## B-002: DecodeWalRecord reports invalid tail records as Incomplete (2026-11-01)
+## B-002: DecodeWalRecord reports invalid tail records as Incomplete
 
 - Symptom: A record with a valid header CRC but an invalid field (key/value length
   over limit, Delete with value_len != 0, bad sequence) and a truncated payload
@@ -26,7 +26,7 @@ affecting correctness, recovery, or data integrity.
 - Fix: Validate all header fields before the length check. Commit 8bddb8c.
 - Regression test: the two tests above.
 
-## B-003: Writable-file factories accepted embedded NUL paths (2026-11-01)
+## B-003: Writable-file factories accepted embedded NUL paths 
 
 - Symptom: A path containing `abc\0suffix` was accepted.
   NewWritableFile created `abc`; OpenAppendableFile returned a writable
