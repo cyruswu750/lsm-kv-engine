@@ -13,3 +13,18 @@ affecting correctness, recovery, or data integrity.
 - Fix: char -> unsigned char -> uintN_t, then shift. Commit 0bfc9cb.
 - Regression test: Coding.DecodeFixed32FromSpecifiedBytes, Coding.DecodeFixed64FromSpecifiedBytes.
 - Lesson: Widen bytes through unsigned char before shifting.
+
+## B-002: DecodeWalRecord reports invalid tail records as Incomplete (2026-11-01)
+
+- Symptom: A record with a valid header CRC but an invalid field (key/value length
+  over limit, Delete with value_len != 0, bad sequence) and a truncated payload
+  decoded as Incomplete instead of Corruption.
+- Found by: WalRecordMalformedTest.OversizedLengths,
+  WalRecordMalformedTest.InvalidFieldsWithMissingPayloadAreCorruption.
+- Root cause: The "remaining < total" check ran before field validation, so a
+  missing payload masked invalid fields. Recovery would treat such a record as a
+  torn tail and silently truncate it instead of failing closed.
+- Fix: Validate all header fields before the length check. Commit 8bddb8c.
+- Regression test: the two tests above.
+- Lesson: Validate everything the header claims before deciding a record is just short.
+
