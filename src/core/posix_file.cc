@@ -10,6 +10,8 @@
 #include <system_error>
 #include <utility>
 
+#include "posix_dir.h"
+
 namespace kv {
 
 namespace {
@@ -140,10 +142,16 @@ Status OpenPosixFile(const std::filesystem::path& path,
             path.string() + ": " + operation + ": output file is not empty");
     }
 
+    // open(2) would stop at an embedded NUL and act on the prefix path.
+    Status s = CheckSyscallPath(path, operation);
+    if (!s.ok()) {
+        return s;
+    }
+
     // Allocate before opening so an allocation failure cannot leak the
     // descriptor or leave a newly created file behind.
     auto file = std::make_unique<PosixWritableFile>(path.string(), syscalls);
-    Status s = file->Open(flags, operation);
+    s = file->Open(flags, operation);
     if (!s.ok()) {
         return s;
     }
