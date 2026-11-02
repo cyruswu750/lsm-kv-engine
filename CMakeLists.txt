@@ -28,6 +28,8 @@ add_library(kv STATIC
     src/core/crc32c.cc
     src/core/wal_codec.cc
     src/core/posix_file.cc
+    src/core/posix_dir.cc
+    src/core/file_lock.cc
     src/core/db.cc
 )
 
