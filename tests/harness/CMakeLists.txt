@@ -10,7 +10,8 @@ add_executable(kv_tests
   db_test.cpp
   db_recovery_test.cpp
   db_fault_test.cpp
-  differential_test.cpp)
+  differential_test.cpp
+  file_names_test.cpp)
 target_link_libraries(kv_tests PRIVATE kv GTest::gtest_main)
 
 include(GoogleTest)

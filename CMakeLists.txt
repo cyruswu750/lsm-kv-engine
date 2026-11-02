@@ -30,6 +30,7 @@ add_library(kv STATIC
     src/core/posix_file.cc
     src/core/posix_dir.cc
     src/core/file_lock.cc
+    src/core/file_names.cc
     src/core/db.cc
 )
 
