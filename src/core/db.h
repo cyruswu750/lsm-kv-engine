@@ -10,6 +10,8 @@
 
 namespace kv {
 
+class DBOpener;
+
 class DB {
 public:
     static Status Open(const std::filesystem::path& directory,
@@ -26,7 +28,14 @@ public:
     DB& operator=(const DB&) = delete;
 
 private:
-    DB() = default;
+    // Internal construction path (db_internal.h).
+    friend class DBOpener;
+
+    struct Impl;
+
+    explicit DB(std::unique_ptr<Impl> impl);
+
+    std::unique_ptr<Impl> impl_;
 };
 
 }
