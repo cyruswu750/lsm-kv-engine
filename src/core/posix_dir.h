@@ -52,12 +52,14 @@ Status CreateDirectory(const std::filesystem::path& dir, bool& out_created);
 // symlink the link itself is renamed. Not durable until the containing
 // directory (both directories, if they differ) is synced.
 Status RenameFile(const std::filesystem::path& from,
-                  const std::filesystem::path& to);
+                  const std::filesystem::path& to,
+                  PosixSyscalls& syscalls = DefaultPosixSyscalls());
 
 // unlink(2): removes exactly one non-directory entry. A directory is
 // never removed (IOError). A symlink is removed, not its target. Not
 // durable until the containing directory is synced.
-Status RemoveFile(const std::filesystem::path& path);
+Status RemoveFile(const std::filesystem::path& path,
+                  PosixSyscalls& syscalls = DefaultPosixSyscalls());
 
 // Opens dir with O_RDONLY | O_DIRECTORY | O_CLOEXEC, calls fsync once, and
 // closes it. A failed fsync (including EINTR) returns IOError and is not

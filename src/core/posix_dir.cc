@@ -145,7 +145,8 @@ Status CreateDirectory(const std::filesystem::path& dir, bool& out_created) {
 }
 
 Status RenameFile(const std::filesystem::path& from,
-                  const std::filesystem::path& to) {
+                  const std::filesystem::path& to,
+                  PosixSyscalls& syscalls) {
     Status s = CheckSyscallPath(from, "rename");
     if (!s.ok()) {
         return s;
@@ -155,7 +156,7 @@ Status RenameFile(const std::filesystem::path& from,
         return s;
     }
 
-    if (::rename(from.c_str(), to.c_str()) != 0) {
+    if (syscalls.Rename(from.c_str(), to.c_str()) != 0) {
         const int err = errno;
         return Status::IOError(from.string() + ": rename to " + to.string() +
                                ": " + ErrnoText(err));
@@ -163,13 +164,14 @@ Status RenameFile(const std::filesystem::path& from,
     return Status::Ok();
 }
 
-Status RemoveFile(const std::filesystem::path& path) {
+Status RemoveFile(const std::filesystem::path& path,
+                  PosixSyscalls& syscalls) {
     Status s = CheckSyscallPath(path, "remove");
     if (!s.ok()) {
         return s;
     }
 
-    if (::unlink(path.c_str()) != 0) {
+    if (syscalls.Unlink(path.c_str()) != 0) {
         return PathError(path, "remove", errno);
     }
     return Status::Ok();
@@ -182,7 +184,8 @@ Status SyncDirectory(const std::filesystem::path& dir,
         return s;
     }
 
-    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const int fd =
+        syscalls.Open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
     if (fd < 0) {
         return PathError(dir, "open directory for sync", errno);
     }
