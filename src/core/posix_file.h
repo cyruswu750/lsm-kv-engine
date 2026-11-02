@@ -3,18 +3,20 @@
 #include <sys/types.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 
 #include "status.h"
 #include "writable_file.h"
 
 namespace kv {
 
-// Syscall seam for PosixWritableFile. Each method has the contract of the
-// matching POSIX call: on failure return -1 and set errno. The base class
-// calls the real syscalls. Tests may subclass it to script results; the
-// production Append/Sync/Close logic runs unchanged on top.
+// Syscall seam for the POSIX file operations in this header. Each method
+// has the contract of the matching POSIX call: on failure return -1 and
+// set errno. The base class calls the real syscalls. Tests may subclass it
+// to script results; the production control flow runs unchanged on top.
 class PosixSyscalls {
 public:
     PosixSyscalls() = default;
@@ -24,6 +26,8 @@ public:
     PosixSyscalls& operator=(const PosixSyscalls&) = delete;
 
     virtual ssize_t Write(int fd, const void* buf, std::size_t count);
+    virtual ssize_t Read(int fd, void* buf, std::size_t count);
+    virtual int Ftruncate(int fd, off_t length);
     virtual int Fsync(int fd);
 
     // As on Linux, the descriptor counts as released even when this fails.
@@ -52,5 +56,39 @@ Status NewWritableFile(const std::filesystem::path& path,
 Status OpenAppendableFile(const std::filesystem::path& path,
                           std::unique_ptr<WritableFile>& out,
                           PosixSyscalls& syscalls = DefaultPosixSyscalls());
+
+// Reads the entire existing regular file at path. Never creates or
+// modifies it. Reads until EOF, accepting short reads and retrying EINTR;
+// any other read error, a non-regular file, or a failed close returns
+// IOError. out is replaced only on success and unchanged on failure. The
+// descriptor is closed on every path, including exceptions (allocation
+// failure propagates as an exception).
+//
+// M1 limitation: the whole file is held in memory, so peak memory grows
+// with file size. Recovery is not bounded-memory for arbitrarily large
+// WAL files.
+Status ReadFileToString(const std::filesystem::path& path,
+                        std::string& out,
+                        PosixSyscalls& syscalls = DefaultPosixSyscalls());
+
+// Truncates the existing regular file at path to exactly length bytes,
+// then fsyncs it once. Never creates the file. Returns InvalidArgument,
+// without modifying the file, if length does not fit in off_t or exceeds
+// the current size (ftruncate would otherwise zero-extend it). ftruncate
+// is retried on EINTR because repeating it is harmless; a failed fsync is
+// never retried. The descriptor is closed exactly once on every path; if
+// cleanup also fails, the first error is reported.
+//
+// An error is not a rollback: after an fsync or close failure the file may
+// already be truncated, and its durable size is unknown.
+//
+// The caller must hold the database lock so no other writer changes the
+// file between reading it, choosing length, and truncating. Later appends
+// must open the file through OpenAppendableFile, whose O_APPEND writes
+// start at the new end of file rather than at a stale offset that would
+// leave a zero-filled gap.
+Status TruncateAndSyncFile(const std::filesystem::path& path,
+                           std::uint64_t length,
+                           PosixSyscalls& syscalls = DefaultPosixSyscalls());
 
 }  // namespace kv
