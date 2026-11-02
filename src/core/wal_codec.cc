@@ -158,13 +158,13 @@ std::size_t WalDecodeResult::next_offset() const {
 WalDecodeResult DecodeWalRecord(std::string_view input,
                                 std::size_t offset,
                                 std::uint64_t previous_sequence) {
+    // Checked before any subtraction or pointer arithmetic.
     if (offset > input.size()) {
         return RecordCorruption(
             offset, "offset beyond input size " + std::to_string(input.size()));
     }
 
     const std::size_t remaining = input.size() - offset;
-
     if (remaining < kWalRecordHeaderSize) {
         return WalDecodeResult::Incomplete();
     }
@@ -176,7 +176,6 @@ WalDecodeResult DecodeWalRecord(std::string_view input,
     const std::uint32_t actual_header_crc = Crc32c(std::string_view(
         header + kHeaderCrcCoveredOffset,
         kWalRecordHeaderSize - kHeaderCrcCoveredOffset));
-
     if (stored_header_crc != actual_header_crc) {
         return RecordCorruption(
             offset, "header checksum mismatch (stored " +
@@ -184,6 +183,7 @@ WalDecodeResult DecodeWalRecord(std::string_view input,
                         Hex32(actual_header_crc) + ")");
     }
 
+    // Fields below are trusted only after the header CRC matched.
     for (std::size_t i = 0; i < kReservedSize; ++i) {
         if (header[kReservedOffset + i] != 0) {
             return RecordCorruption(offset, "reserved header bytes are nonzero");
@@ -192,22 +192,14 @@ WalDecodeResult DecodeWalRecord(std::string_view input,
 
     const auto raw_type =
         static_cast<std::uint8_t>(header[kTypeOffset]);
-
     if (!IsValidType(raw_type)) {
         return RecordCorruption(
             offset, "invalid record type " + std::to_string(raw_type));
     }
-
     const auto type = static_cast<ValueType>(raw_type);
 
     const std::uint32_t key_len = DecodeFixed32(header + kKeyLengthOffset);
     const std::uint32_t value_len = DecodeFixed32(header + kValueLengthOffset);
-    const std::uint64_t total = std::uint64_t{kWalRecordHeaderSize} +
-                                key_len + value_len;
-
-    if (total > remaining) {
-        return WalDecodeResult::Incomplete();
-    }
 
     if (type == ValueType::kDelete && value_len != 0) {
         return RecordCorruption(
@@ -228,7 +220,6 @@ WalDecodeResult DecodeWalRecord(std::string_view input,
     }
 
     const std::uint64_t sequence = DecodeFixed64(header + kSequenceOffset);
-
     if (sequence == 0) {
         return RecordCorruption(offset, "sequence is zero");
     }
@@ -240,6 +231,12 @@ WalDecodeResult DecodeWalRecord(std::string_view input,
                         std::to_string(previous_sequence));
     }
 
+    // Both lengths are bounded above, so this 64-bit sum cannot overflow.
+    const std::uint64_t total = std::uint64_t{kWalRecordHeaderSize} +
+                                key_len + value_len;
+    if (total > remaining) {
+        return WalDecodeResult::Incomplete();
+    }
 
     const std::string_view key(header + kWalRecordHeaderSize, key_len);
     const std::string_view value(key.data() + key_len, value_len);
@@ -247,7 +244,6 @@ WalDecodeResult DecodeWalRecord(std::string_view input,
     const std::uint32_t stored_payload_crc =
         DecodeFixed32(header + kPayloadCrcOffset);
     const std::uint32_t actual_payload_crc = PayloadCrc(key, value);
-
     if (stored_payload_crc != actual_payload_crc) {
         return RecordCorruption(
             offset, "payload checksum mismatch (stored " +
@@ -260,9 +256,8 @@ WalDecodeResult DecodeWalRecord(std::string_view input,
     record.type = type;
     record.key = key;
     record.value = value;
-
-    return WalDecodeResult::Ok(
-        record, offset + static_cast<std::size_t>(total));
+    return WalDecodeResult::Ok(record,
+                               offset + static_cast<std::size_t>(total));
 }
 
 }  // namespace kv
