@@ -6,7 +6,11 @@ add_executable(kv_tests
   crc32c_test.cpp
   wal_codec_test.cpp
   posix_file_test.cpp
-  posix_dir_test.cpp)
+  posix_dir_test.cpp
+  db_test.cpp
+  db_recovery_test.cpp
+  db_fault_test.cpp
+  differential_test.cpp)
 target_link_libraries(kv_tests PRIVATE kv GTest::gtest_main)
 
 include(GoogleTest)
