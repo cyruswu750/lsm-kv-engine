@@ -1,10 +1,12 @@
 #include "posix_file.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -19,6 +21,8 @@ namespace {
 // Linux transfers at most 0x7ffff000 bytes per write(2) call, and this also
 // keeps each request within SSIZE_MAX on 32-bit systems.
 constexpr std::size_t kMaxWriteSize = 0x7ffff000;
+
+constexpr std::size_t kReadChunkSize = 64 * 1024;
 
 std::string ErrnoText(int err) {
     return std::generic_category().message(err);
@@ -160,10 +164,60 @@ Status OpenPosixFile(const std::filesystem::path& path,
     return Status::Ok();
 }
 
+// Owns a descriptor for one operation. The destructor closes it on early
+// returns and exceptions; Close() closes it explicitly so the result can
+// be reported. Either way close runs at most once and is never retried.
+class ScopedFd {
+public:
+    ScopedFd(int fd, PosixSyscalls& syscalls) : fd_(fd), syscalls_(syscalls) {}
+
+    ~ScopedFd() {
+        if (fd_ >= 0) {
+            syscalls_.Close(fd_);
+        }
+    }
+
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+
+    int get() const {
+        return fd_;
+    }
+
+    // Returns 0, or the errno of a failed close.
+    int Close() {
+        const int fd = fd_;
+        fd_ = -1;
+        return syscalls_.Close(fd) == 0 ? 0 : errno;
+    }
+
+private:
+    int fd_;
+    PosixSyscalls& syscalls_;
+};
+
+// Closes fd and returns IOError(message), noting a close failure without
+// replacing the primary error.
+Status FailAndClose(ScopedFd& fd, std::string message) {
+    const int close_err = fd.Close();
+    if (close_err != 0) {
+        message += " (close also failed: " + ErrnoText(close_err) + ")";
+    }
+    return Status::IOError(std::move(message));
+}
+
 }  // namespace
 
 ssize_t PosixSyscalls::Write(int fd, const void* buf, std::size_t count) {
     return ::write(fd, buf, count);
+}
+
+ssize_t PosixSyscalls::Read(int fd, void* buf, std::size_t count) {
+    return ::read(fd, buf, count);
+}
+
+int PosixSyscalls::Ftruncate(int fd, off_t length) {
+    return ::ftruncate(fd, length);
 }
 
 int PosixSyscalls::Fsync(int fd) {
@@ -192,6 +246,139 @@ Status OpenAppendableFile(const std::filesystem::path& path,
                           PosixSyscalls& syscalls) {
     return OpenPosixFile(path, O_WRONLY | O_APPEND | O_CLOEXEC,
                          "open for append", out, syscalls);
+}
+
+Status ReadFileToString(const std::filesystem::path& path,
+                        std::string& out,
+                        PosixSyscalls& syscalls) {
+    Status s = CheckSyscallPath(path, "read");
+    if (!s.ok()) {
+        return s;
+    }
+    const std::string name = path.string();
+
+    const int raw_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (raw_fd < 0) {
+        const int err = errno;
+        return Status::IOError(name + ": open for read: " + ErrnoText(err));
+    }
+    ScopedFd fd(raw_fd, syscalls);
+
+    struct stat st;
+    if (::fstat(fd.get(), &st) != 0) {
+        const int err = errno;
+        return FailAndClose(fd, name + ": fstat: " + ErrnoText(err));
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return FailAndClose(fd, name + ": read: not a regular file");
+    }
+
+    std::string result;
+    // The size is only a capacity hint; reading continues until EOF.
+    if (static_cast<std::uint64_t>(st.st_size) <= result.max_size()) {
+        result.reserve(static_cast<std::size_t>(st.st_size));
+    }
+
+    std::string buffer(kReadChunkSize, '\0');
+    for (;;) {
+        const ssize_t n = syscalls.Read(fd.get(), buffer.data(), buffer.size());
+        if (n < 0) {
+            const int err = errno;
+            if (err == EINTR) {
+                continue;
+            }
+            return FailAndClose(fd, name + ": read failed after " +
+                                        std::to_string(result.size()) +
+                                        " bytes: " + ErrnoText(err));
+        }
+        if (n == 0) {
+            break;
+        }
+        if (static_cast<std::size_t>(n) > buffer.size()) {
+            return FailAndClose(fd, name + ": read returned " +
+                                        std::to_string(n) +
+                                        " for a request of " +
+                                        std::to_string(buffer.size()) +
+                                        " bytes");
+        }
+        result.append(buffer.data(), static_cast<std::size_t>(n));
+    }
+
+    const int close_err = fd.Close();
+    if (close_err != 0) {
+        return Status::IOError(name + ": close after read: " +
+                               ErrnoText(close_err));
+    }
+
+    out = std::move(result);
+    return Status::Ok();
+}
+
+Status TruncateAndSyncFile(const std::filesystem::path& path,
+                           std::uint64_t length,
+                           PosixSyscalls& syscalls) {
+    Status s = CheckSyscallPath(path, "truncate");
+    if (!s.ok()) {
+        return s;
+    }
+    const std::string name = path.string();
+    const std::string length_text = std::to_string(length);
+
+    if (length >
+        static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+        return Status::InvalidArgument(name + ": truncate: length " +
+                                       length_text +
+                                       " is not representable as off_t");
+    }
+    const off_t target = static_cast<off_t>(length);
+
+    const int raw_fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    if (raw_fd < 0) {
+        const int err = errno;
+        return Status::IOError(name + ": open for truncate: " +
+                               ErrnoText(err));
+    }
+    ScopedFd fd(raw_fd, syscalls);
+
+    struct stat st;
+    if (::fstat(fd.get(), &st) != 0) {
+        const int err = errno;
+        return FailAndClose(fd, name + ": fstat: " + ErrnoText(err));
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return FailAndClose(fd, name + ": truncate: not a regular file");
+    }
+    if (target > st.st_size) {
+        return Status::InvalidArgument(
+            name + ": truncate: length " + length_text +
+            " exceeds current size " + std::to_string(st.st_size) +
+            "; refusing to extend the file");
+    }
+
+    while (syscalls.Ftruncate(fd.get(), target) != 0) {
+        const int err = errno;
+        if (err == EINTR) {
+            continue;
+        }
+        return FailAndClose(fd, name + ": ftruncate to " + length_text +
+                                    ": " + ErrnoText(err));
+    }
+
+    // Never retried: see PosixWritableFile::Sync.
+    if (syscalls.Fsync(fd.get()) != 0) {
+        const int err = errno;
+        return FailAndClose(fd, name + ": fsync after truncate to " +
+                                    length_text + ": " + ErrnoText(err) +
+                                    "; truncation may already have taken "
+                                    "effect");
+    }
+
+    const int close_err = fd.Close();
+    if (close_err != 0) {
+        return Status::IOError(name + ": close after truncate: " +
+                               ErrnoText(close_err));
+    }
+    return Status::Ok();
 }
 
 }  // namespace kv
