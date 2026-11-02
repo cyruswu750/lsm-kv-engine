@@ -13,7 +13,8 @@ add_executable(kv_tests
   differential_test.cpp
   file_names_test.cpp
   sst_test.cpp
-  manifest_test.cpp)
+  manifest_test.cpp
+  db_m2_test.cpp)
 target_link_libraries(kv_tests PRIVATE kv GTest::gtest_main)
 
 include(GoogleTest)

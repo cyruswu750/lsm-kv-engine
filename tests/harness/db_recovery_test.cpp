@@ -12,6 +12,7 @@
 
 #include "core/db.h"
 #include "core/types.h"
+#include "testing/manifest_builder.h"
 #include "testing/temp_dir.h"
 #include "testing/wal_builder.h"
 
@@ -93,12 +94,13 @@ Model ApplyPrefix(const std::vector<Op>& ops, std::size_t n) {
 class DBRecoveryTest : public ::testing::Test {
 protected:
     fs::path Db() const { return tmp_.path() / "db"; }
-    fs::path Wal() const { return Db() / "000001.wal"; }
+    // M2 layout: the active WAL is named by MANIFEST (generation 1,
+    // checkpoint 0); its WAL v1 bytes are what these tests exercise.
+    fs::path Wal() const { return Db() / "wal-000001.log"; }
 
     void ResetWal(const std::string& bytes) {
         fs::remove_all(Db());
-        fs::create_directory(Db());
-        ASSERT_TRUE(WriteBytes(Wal(), bytes));
+        ASSERT_TRUE(test::MakeWalOnlyDb(Db(), bytes));
     }
 
     Status OpenDb(std::unique_ptr<DB>& db, bool create = true) {
@@ -121,7 +123,10 @@ protected:
             EXPECT_TRUE(Contains(s.message, detail)) << s.message;
             EXPECT_EQ(db, nullptr);
             EXPECT_EQ(ReadBytesOrEmpty(Wal()), wal);
-            EXPECT_FALSE(fs::exists(Db() / "000001.wal.tmp"));
+            EXPECT_EQ(ReadBytesOrEmpty(Db() / "MANIFEST"),
+                      test::ManifestBytes(test::RawManifest{}));
+            EXPECT_FALSE(fs::exists(Db() / "wal-000001.log.tmp"));
+            EXPECT_FALSE(fs::exists(Db() / "MANIFEST.tmp"));
         }
     }
 

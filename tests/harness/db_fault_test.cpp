@@ -17,6 +17,7 @@
 #include "core/db_internal.h"
 #include "core/file_lock.h"
 #include "testing/fault_syscalls.h"
+#include "testing/manifest_builder.h"
 #include "testing/temp_dir.h"
 #include "testing/wal_builder.h"
 
@@ -80,8 +81,9 @@ Model Snapshot(const DB& db, const std::vector<std::string>& keys) {
 class DBFaultTest : public ::testing::Test {
 protected:
     fs::path Db() const { return tmp_.path() / "db"; }
-    fs::path Wal() const { return Db() / "000001.wal"; }
-    fs::path Temp() const { return Db() / "000001.wal.tmp"; }
+    // M2 layout (docs/sst-format.md section 2).
+    fs::path Wal() const { return Db() / "wal-000001.log"; }
+    fs::path Temp() const { return Db() / "wal-000001.log.tmp"; }
 
     static std::string Canonical(const fs::path& p) {
         return fs::weakly_canonical(p).string();
@@ -280,12 +282,22 @@ TEST_F(DBFaultTest, HeaderWriteFailureDuringInitialization) {
     EXPECT_EQ(s.code, Code::IOError) << s.ToString();
     EXPECT_EQ(db, nullptr);
     EXPECT_FALSE(fs::exists(Wal()));
+    EXPECT_FALSE(fs::exists(Db() / "MANIFEST"));
     ExpectLockReleased();
 
-    // The partial temporary file is recognized and replaced.
-    ASSERT_TRUE(OpenReal(db).ok());
-    EXPECT_EQ(ReadBytesOrEmpty(Wal()), WalFileHeaderBytes());
-    EXPECT_FALSE(fs::exists(Temp()));
+    // M2 format boundary (docs/sst-format.md section 8, row 7): M1
+    // recognized and replaced the partial temporary file. In M2, residue
+    // without MANIFEST is Corruption and is preserved, not reinitialized.
+    const std::string partial = ReadBytesOrEmpty(Temp());
+    EXPECT_EQ(partial, WalFileHeaderBytes().substr(0, 4));
+    for (bool create : {false, true}) {
+        const Status r = OpenReal(db, create);
+        EXPECT_EQ(r.code, Code::Corruption) << r.ToString();
+        EXPECT_TRUE(Contains(r.message, "wal-000001.log.tmp")) << r.message;
+        EXPECT_EQ(db, nullptr);
+        EXPECT_EQ(ReadBytesOrEmpty(Temp()), partial);
+        EXPECT_FALSE(fs::exists(Wal()));
+    }
 }
 
 TEST_F(DBFaultTest, TempFileSyncFailureDoesNotPublishWal) {
@@ -304,11 +316,15 @@ TEST_F(DBFaultTest, TempFileSyncFailureDoesNotPublishWal) {
     EXPECT_TRUE(fs::exists(Temp()));
     ExpectLockReleased();
 
-    // Uninitialized with only LOCK and tmp: create_if_missing decides.
-    EXPECT_EQ(OpenReal(db, false).code, Code::NotFound);
-    EXPECT_TRUE(fs::exists(Temp()));
-    ASSERT_TRUE(OpenReal(db, true).ok());
-    EXPECT_FALSE(fs::exists(Temp()));
+    // M2 format boundary (docs/sst-format.md section 8, row 7): M1
+    // treated LOCK + tmp as uninitialized (NotFound, or initialize). In M2
+    // the residue is Corruption for either setting and is preserved.
+    for (bool create : {false, true}) {
+        EXPECT_EQ(OpenReal(db, create).code, Code::Corruption);
+        EXPECT_EQ(db, nullptr);
+        EXPECT_TRUE(fs::exists(Temp()));
+        EXPECT_FALSE(fs::exists(Wal()));
+    }
 }
 
 TEST_F(DBFaultTest, DirectorySyncFailureAfterRenameExposesNoHandle) {
@@ -325,8 +341,36 @@ TEST_F(DBFaultTest, DirectorySyncFailureAfterRenameExposesNoHandle) {
     EXPECT_EQ(db, nullptr);
     ExpectLockReleased();
 
-    // The rename already happened; an error is not a rollback.
+    // The WAL rename already happened; an error is not a rollback.
     EXPECT_EQ(ReadBytesOrEmpty(Wal()), WalFileHeaderBytes());
+    // M2 format boundary (docs/sst-format.md section 8): this was the
+    // WAL's directory sync, before MANIFEST existed. M1 reopened the
+    // published WAL; in M2 a WAL without MANIFEST is preserved residue.
+    EXPECT_FALSE(fs::exists(Db() / "MANIFEST"));
+    EXPECT_EQ(OpenReal(db, false).code, Code::Corruption);
+    EXPECT_EQ(db, nullptr);
+}
+
+// The M1 property above, for the directory sync that publishes MANIFEST:
+// the rename already happened, so a later Open finds a valid database.
+TEST_F(DBFaultTest, ManifestDirectorySyncFailureExposesNoHandle) {
+    fs::create_directory(Db());
+    FaultSyscalls sys;
+    sys.armed = true;
+    const std::size_t rule = sys.FailOn("fsync", "db", EIO, /*skip=*/1);
+
+    std::unique_ptr<DB> db;
+    const Status s = OpenWith(sys, db);
+    EXPECT_EQ(s.code, Code::IOError) << s.ToString();
+    EXPECT_TRUE(Contains(s.message, "fsync directory")) << s.message;
+    EXPECT_EQ(db, nullptr);
+    EXPECT_EQ(sys.rules[rule].fired, 1u);
+    EXPECT_LT(sys.IndexOf("rename", "MANIFEST.tmp -> MANIFEST"),
+              sys.trace.size());
+    ExpectLockReleased();
+
+    EXPECT_EQ(ReadBytesOrEmpty(Db() / "MANIFEST"),
+              test::ManifestBytes(test::RawManifest{}));
     ASSERT_TRUE(OpenReal(db, false).ok());
     ASSERT_TRUE(db->Put("k", "v").ok());
 }
@@ -355,8 +399,7 @@ protected:
     void SetUp() override {
         good_ = WalFileHeaderBytes() + RawRecord(1, kRawPut, "k", "v");
         torn_ = good_ + RawRecord(2, kRawPut, "k", "w").substr(0, 20);
-        fs::create_directory(Db());
-        ASSERT_TRUE(WriteBytes(Wal(), torn_));
+        ASSERT_TRUE(test::MakeWalOnlyDb(Db(), torn_));
     }
 
     std::string good_;

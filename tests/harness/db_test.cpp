@@ -16,6 +16,7 @@
 #include "core/db.h"
 #include "core/file_lock.h"
 #include "core/types.h"
+#include "testing/manifest_builder.h"
 #include "testing/temp_dir.h"
 #include "testing/wal_builder.h"
 
@@ -26,6 +27,8 @@ namespace fs = std::filesystem;
 
 using test::kRawDelete;
 using test::kRawPut;
+using test::ManifestBytes;
+using test::RawManifest;
 using test::RawRecord;
 using test::ReadBytesOrEmpty;
 using test::WalFileHeaderBytes;
@@ -71,11 +74,15 @@ std::optional<std::string> Lookup(const DB& db, std::string_view key) {
 const std::string kBinKey("\x00k\xff\x80", 4);
 const std::string kBinValue("\xff\x00v\x00\x7f", 5);
 
+// M2 layout (docs/sst-format.md section 2): the initial WAL is
+// wal-000001.log, named by MANIFEST. The WAL v1 bytes are unchanged from M1.
 class DBTest : public ::testing::Test {
 protected:
     fs::path Db() const { return tmp_.path() / "db"; }
-    fs::path Wal() const { return Db() / "000001.wal"; }
-    fs::path Temp() const { return Db() / "000001.wal.tmp"; }
+    fs::path Wal() const { return Db() / "wal-000001.log"; }
+    fs::path Temp() const { return Db() / "wal-000001.log.tmp"; }
+    fs::path M1Temp() const { return Db() / "000001.wal.tmp"; }
+    fs::path Manifest() const { return Db() / "MANIFEST"; }
     fs::path LockPath() const { return Db() / "LOCK"; }
 
     Status OpenDb(std::unique_ptr<DB>& db, bool create = true) {
@@ -91,10 +98,10 @@ protected:
         return db;
     }
 
-    // Creates the database directory holding exactly these WAL bytes.
+    // Creates an M2 database whose active WAL holds exactly these bytes
+    // and whose manifest (generation 1, checkpoint 0) references it.
     void MakeWal(const std::string& bytes) {
-        fs::create_directory(Db());
-        ASSERT_TRUE(WriteBytes(Wal(), bytes));
+        ASSERT_TRUE(test::MakeWalOnlyDb(Db(), bytes));
     }
 
     test::TempDir tmp_;
@@ -370,8 +377,11 @@ TEST_F(DBTest, MissingDirectoryWithoutCreateIsNotFound) {
 TEST_F(DBTest, MissingDirectoryWithCreateInitializes) {
     auto db = MustOpen();
     ASSERT_NE(db, nullptr);
-    EXPECT_EQ(Entries(Db()), (std::vector<std::string>{"000001.wal", "LOCK"}));
+    EXPECT_EQ(Entries(Db()), (std::vector<std::string>{"LOCK", "MANIFEST",
+                                                       "wal-000001.log"}));
     EXPECT_EQ(ReadBytesOrEmpty(Wal()), WalFileHeaderBytes());
+    // Generation 1, next file ID 2, checkpoint 0, active WAL 1, no SSTs.
+    EXPECT_EQ(ReadBytesOrEmpty(Manifest()), ManifestBytes(RawManifest{}));
 }
 
 TEST_F(DBTest, TrailingSeparatorInPathIsAccepted) {
@@ -434,21 +444,32 @@ TEST_F(DBTest, UninitializedStatesFollowCreateIfMissing) {
             ASSERT_TRUE(WriteBytes(LockPath(), "lock contents"));
         }
         if (c.temp) {
-            ASSERT_TRUE(WriteBytes(Temp(), "partial header"));
+            ASSERT_TRUE(WriteBytes(M1Temp(), "partial header"));
         }
         const std::vector<std::string> before = Entries(Db());
 
         std::unique_ptr<DB> db;
-        EXPECT_EQ(OpenDb(db, false).code, Code::NotFound);
-        EXPECT_EQ(db, nullptr);
-        EXPECT_EQ(Entries(Db()), before);  // no LOCK, WAL, or tmp removal
         if (c.temp) {
-            EXPECT_EQ(ReadBytesOrEmpty(Temp()), "partial header");
+            // M2 format boundary (docs/sst-format.md section 8, row 6):
+            // 000001.wal.tmp is M1 initialization residue. M1 removed it and
+            // initialized; M2 rejects the directory and changes nothing.
+            for (bool create : {false, true}) {
+                const Status s = OpenDb(db, create);
+                EXPECT_EQ(s.code, Code::UnsupportedFormat) << s.ToString();
+                EXPECT_EQ(db, nullptr);
+                EXPECT_EQ(Entries(Db()), before);
+                EXPECT_EQ(ReadBytesOrEmpty(M1Temp()), "partial header");
+            }
+            continue;
         }
 
+        EXPECT_EQ(OpenDb(db, false).code, Code::NotFound);
+        EXPECT_EQ(db, nullptr);
+        EXPECT_EQ(Entries(Db()), before);  // no LOCK, WAL, or MANIFEST
+
         ASSERT_TRUE(OpenDb(db, true).ok());
-        EXPECT_EQ(Entries(Db()),
-                  (std::vector<std::string>{"000001.wal", "LOCK"}));
+        EXPECT_EQ(Entries(Db()), (std::vector<std::string>{
+                                     "LOCK", "MANIFEST", "wal-000001.log"}));
         EXPECT_EQ(ReadBytesOrEmpty(Wal()), WalFileHeaderBytes());
         if (c.lock) {
             EXPECT_EQ(ReadBytesOrEmpty(LockPath()), "lock contents");
@@ -468,6 +489,10 @@ TEST_F(DBTest, UnrelatedEntriesWithoutWalAreRejected) {
         {".hidden", false, false},    {"000002.wal", false, false},
         {"subdir", true, false},      {"000001.wal.tmp", true, false},
         {"notes.txt", false, true},
+        // Engine names count as residue only when they are regular files.
+        {"sst-000002.sst", true, false}, {"MANIFEST.tmp", true, false},
+        // Non-canonical IDs are not engine names.
+        {"wal-0000001.log", false, false}, {"sst-000000.sst", false, false},
     };
     for (const Case& c : cases) {
         SCOPED_TRACE(c.name);
@@ -501,8 +526,7 @@ TEST_F(DBTest, NonRegularLockIsRejected) {
     for (bool symlink : {false, true}) {
         SCOPED_TRACE(symlink ? "symlink" : "directory");
         fs::remove_all(Db());
-        fs::create_directory(Db());
-        ASSERT_TRUE(WriteBytes(Wal(), WalFileHeaderBytes()));
+        MakeWal(WalFileHeaderBytes());
         if (symlink) {
             ASSERT_TRUE(WriteBytes(tmp_.path() / "elsewhere", ""));
             fs::create_symlink(tmp_.path() / "elsewhere", LockPath());
@@ -533,15 +557,22 @@ TEST_F(DBTest, ExistingWalToleratesUnrelatedEntries) {
     EXPECT_TRUE(fs::is_directory(Db() / "subdir"));
 }
 
+// M2 analog of the M1 leftover-temp rule: with a valid MANIFEST, regular
+// leftover engine temporaries covered by the manifest's next file ID are
+// removed. The M1 name is not an M2 engine file and is left alone.
 TEST_F(DBTest, ExistingWalRemovesOnlyRecognizedLeftoverTemp) {
     MakeWal(WalFileHeaderBytes() + RawRecord(1, kRawPut, "k", "v"));
     ASSERT_TRUE(WriteBytes(Temp(), "stale"));
+    ASSERT_TRUE(WriteBytes(Db() / "MANIFEST.tmp", "stale"));
+    ASSERT_TRUE(WriteBytes(M1Temp(), "m1"));
     {
         std::unique_ptr<DB> db;
         ASSERT_TRUE(OpenDb(db, false).ok());
         EXPECT_EQ(Lookup(*db, "k"), "v");
     }
     EXPECT_FALSE(fs::exists(Temp()));
+    EXPECT_FALSE(fs::exists(Db() / "MANIFEST.tmp"));
+    EXPECT_EQ(ReadBytesOrEmpty(M1Temp()), "m1");
 
     // A non-regular entry with that name is not the engine's file.
     fs::create_directory(Temp());
@@ -591,6 +622,7 @@ TEST_F(DBTest, NonRegularWalIsCorruptionWithoutBlocking) {
         SCOPED_TRACE(c.name);
         fs::remove_all(Db());
         fs::create_directory(Db());
+        ASSERT_TRUE(WriteBytes(Manifest(), ManifestBytes(RawManifest{})));
         if (c.kind == 0) {
             ASSERT_EQ(::mkfifo(Wal().c_str(), 0600), 0);
         } else if (c.kind == 1) {
