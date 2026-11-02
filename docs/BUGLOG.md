@@ -12,7 +12,6 @@ affecting correctness, recovery, or data integrity.
   64-bit shifted as `int` before widening (UB for shifts >= 32).
 - Fix: char -> unsigned char -> uintN_t, then shift. Commit 0bfc9cb.
 - Regression test: Coding.DecodeFixed32FromSpecifiedBytes, Coding.DecodeFixed64FromSpecifiedBytes.
-- Lesson: Widen bytes through unsigned char before shifting.
 
 ## B-002: DecodeWalRecord reports invalid tail records as Incomplete (2026-11-01)
 
@@ -26,5 +25,23 @@ affecting correctness, recovery, or data integrity.
   torn tail and silently truncate it instead of failing closed.
 - Fix: Validate all header fields before the length check. Commit 8bddb8c.
 - Regression test: the two tests above.
-- Lesson: Validate everything the header claims before deciding a record is just short.
+
+## B-003: Writable-file factories accepted embedded NUL paths
+
+- Symptom: A path containing `abc\0suffix` was accepted.
+  NewWritableFile created `abc`; OpenAppendableFile returned a writable
+  handle to an existing `abc`. Found while reviewing path validation
+  during the directory-operations task.
+
+- Cause: OpenPosixFile passed the path to open without checking for
+  embedded NUL bytes. The syscall interpreted only the prefix before NUL.
+
+- Fix: Reuse CheckSyscallPath before allocation and open in
+  src/core/posix_file.cc. Invalid paths return InvalidArgument without
+  opening the prefix path. Empty paths are also rejected consistently.
+
+- Verification: CreateNewRejectsEmbeddedNulPath and
+  OpenAppendableRejectsEmbeddedNulPath both failed before the fix and
+  passed afterward. The full suite passed 151/151 under ASan/UBSan.
+  Regression commit: 19b3cf3. Fix commit: cca0dd1.
 
