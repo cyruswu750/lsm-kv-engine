@@ -42,7 +42,7 @@ public:
 
     // Opens path with flags; called once, before the file is published.
     Status Open(int flags, const char* operation) {
-        const int fd = ::open(path_.c_str(), flags, 0644);
+        const int fd = syscalls_->Open(path_.c_str(), flags, 0644);
         if (fd < 0) {
             const int err = errno;
             return Status::IOError(path_ + ": " + operation + ": " +
@@ -208,6 +208,10 @@ Status FailAndClose(ScopedFd& fd, std::string message) {
 
 }  // namespace
 
+int PosixSyscalls::Open(const char* path, int flags, mode_t mode) {
+    return ::open(path, flags, mode);
+}
+
 ssize_t PosixSyscalls::Write(int fd, const void* buf, std::size_t count) {
     return ::write(fd, buf, count);
 }
@@ -216,12 +220,31 @@ ssize_t PosixSyscalls::Read(int fd, void* buf, std::size_t count) {
     return ::read(fd, buf, count);
 }
 
+ssize_t PosixSyscalls::Pread(int fd,
+                             void* buf,
+                             std::size_t count,
+                             off_t offset) {
+    return ::pread(fd, buf, count, offset);
+}
+
+int PosixSyscalls::Fstat(int fd, struct stat* st) {
+    return ::fstat(fd, st);
+}
+
 int PosixSyscalls::Ftruncate(int fd, off_t length) {
     return ::ftruncate(fd, length);
 }
 
 int PosixSyscalls::Fsync(int fd) {
     return ::fsync(fd);
+}
+
+int PosixSyscalls::Rename(const char* from, const char* to) {
+    return ::rename(from, to);
+}
+
+int PosixSyscalls::Unlink(const char* path) {
+    return ::unlink(path);
 }
 
 int PosixSyscalls::Close(int fd) {
@@ -257,7 +280,7 @@ Status ReadFileToString(const std::filesystem::path& path,
     }
     const std::string name = path.string();
 
-    const int raw_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    const int raw_fd = syscalls.Open(path.c_str(), O_RDONLY | O_CLOEXEC, 0);
     if (raw_fd < 0) {
         const int err = errno;
         return Status::IOError(name + ": open for read: " + ErrnoText(err));
@@ -265,7 +288,7 @@ Status ReadFileToString(const std::filesystem::path& path,
     ScopedFd fd(raw_fd, syscalls);
 
     struct stat st;
-    if (::fstat(fd.get(), &st) != 0) {
+    if (syscalls.Fstat(fd.get(), &st) != 0) {
         const int err = errno;
         return FailAndClose(fd, name + ": fstat: " + ErrnoText(err));
     }
@@ -332,7 +355,7 @@ Status TruncateAndSyncFile(const std::filesystem::path& path,
     }
     const off_t target = static_cast<off_t>(length);
 
-    const int raw_fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    const int raw_fd = syscalls.Open(path.c_str(), O_WRONLY | O_CLOEXEC, 0);
     if (raw_fd < 0) {
         const int err = errno;
         return Status::IOError(name + ": open for truncate: " +
@@ -341,7 +364,7 @@ Status TruncateAndSyncFile(const std::filesystem::path& path,
     ScopedFd fd(raw_fd, syscalls);
 
     struct stat st;
-    if (::fstat(fd.get(), &st) != 0) {
+    if (syscalls.Fstat(fd.get(), &st) != 0) {
         const int err = errno;
         return FailAndClose(fd, name + ": fstat: " + ErrnoText(err));
     }
@@ -377,6 +400,110 @@ Status TruncateAndSyncFile(const std::filesystem::path& path,
     if (close_err != 0) {
         return Status::IOError(name + ": close after truncate: " +
                                ErrnoText(close_err));
+    }
+    return Status::Ok();
+}
+
+RandomAccessFile::~RandomAccessFile() {
+    if (fd_ >= 0) {
+        // Errors are unreportable here and the fd is released either way.
+        syscalls_->Close(fd_);
+    }
+}
+
+Status RandomAccessFile::Open(const std::filesystem::path& path,
+                              PosixSyscalls& syscalls,
+                              std::unique_ptr<RandomAccessFile>& out) {
+    if (out) {
+        return Status::InvalidArgument(path.string() +
+                                       ": open for read: output is not empty");
+    }
+    Status s = CheckSyscallPath(path, "open for read");
+    if (!s.ok()) {
+        return s;
+    }
+
+    // Allocate before opening so an allocation failure cannot leak the fd.
+    std::unique_ptr<RandomAccessFile> file(
+        new RandomAccessFile(path.string(), syscalls));
+    const std::string& name = file->path_;
+
+    file->fd_ = syscalls.Open(
+        name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
+    if (file->fd_ < 0) {
+        const int err = errno;
+        return Status::IOError(name + ": open for read: " + ErrnoText(err));
+    }
+
+    struct stat st;
+    if (syscalls.Fstat(file->fd_, &st) != 0) {
+        const int err = errno;
+        return Status::IOError(name + ": fstat: " + ErrnoText(err));
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return Status::IOError(name + ": read: not a regular file");
+    }
+    file->size_ = static_cast<std::uint64_t>(st.st_size);
+
+    out = std::move(file);
+    return Status::Ok();
+}
+
+Status RandomAccessFile::Read(std::uint64_t offset,
+                              std::size_t n,
+                              char* dst) const {
+    if (fd_ < 0) {
+        return Status::IOError(path_ + ": read: file is closed");
+    }
+    const auto max_off =
+        static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+    if (offset > max_off || n > max_off - offset) {
+        return Status::IOError(path_ + ": read of " + std::to_string(n) +
+                               " bytes at offset " + std::to_string(offset) +
+                               " is not representable as off_t");
+    }
+
+    std::size_t done = 0;
+    while (done < n) {
+        const std::size_t request = std::min(n - done, kMaxWriteSize);
+        const ssize_t got = syscalls_->Pread(
+            fd_, dst + done, request, static_cast<off_t>(offset + done));
+        if (got < 0) {
+            const int err = errno;
+            if (err == EINTR) {
+                continue;
+            }
+            return Status::IOError(path_ + ": pread at offset " +
+                                   std::to_string(offset + done) + ": " +
+                                   ErrnoText(err));
+        }
+        if (got == 0) {
+            return Status::IOError(
+                path_ + ": unexpected end of file at offset " +
+                std::to_string(offset + done) + " while reading " +
+                std::to_string(n) + " bytes at offset " +
+                std::to_string(offset));
+        }
+        if (static_cast<std::size_t>(got) > request) {
+            return Status::IOError(path_ + ": pread returned " +
+                                   std::to_string(got) + " for a request of " +
+                                   std::to_string(request) + " bytes");
+        }
+        done += static_cast<std::size_t>(got);
+    }
+    return Status::Ok();
+}
+
+Status RandomAccessFile::Close() {
+    if (fd_ < 0) {
+        return Status::Ok();
+    }
+    // As in PosixWritableFile::Close: mark closed first, never retry.
+    const int fd = fd_;
+    fd_ = -1;
+    if (syscalls_->Close(fd) != 0) {
+        const int err = errno;
+        return Status::IOError(path_ + ": close: " + ErrnoText(err));
     }
     return Status::Ok();
 }

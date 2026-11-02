@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sys/stat.h>
 #include <sys/types.h>
 
 #include <cstddef>
@@ -7,6 +8,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "status.h"
 #include "writable_file.h"
@@ -25,10 +27,15 @@ public:
     PosixSyscalls(const PosixSyscalls&) = delete;
     PosixSyscalls& operator=(const PosixSyscalls&) = delete;
 
+    virtual int Open(const char* path, int flags, mode_t mode);
     virtual ssize_t Write(int fd, const void* buf, std::size_t count);
     virtual ssize_t Read(int fd, void* buf, std::size_t count);
+    virtual ssize_t Pread(int fd, void* buf, std::size_t count, off_t offset);
+    virtual int Fstat(int fd, struct stat* st);
     virtual int Ftruncate(int fd, off_t length);
     virtual int Fsync(int fd);
+    virtual int Rename(const char* from, const char* to);
+    virtual int Unlink(const char* path);
 
     // As on Linux, the descriptor counts as released even when this fails.
     virtual int Close(int fd);
@@ -90,5 +97,49 @@ Status ReadFileToString(const std::filesystem::path& path,
 Status TruncateAndSyncFile(const std::filesystem::path& path,
                            std::uint64_t length,
                            PosixSyscalls& syscalls = DefaultPosixSyscalls());
+
+// Read-only positional access to an existing regular file. Open uses
+// O_NOFOLLOW and O_NONBLOCK, so a symlink fails and a FIFO is rejected
+// as non-regular instead of blocking. The size is taken once at Open.
+// The descriptor is closed by Close or the destructor, exactly once.
+class RandomAccessFile {
+public:
+    ~RandomAccessFile();
+
+    RandomAccessFile(const RandomAccessFile&) = delete;
+    RandomAccessFile& operator=(const RandomAccessFile&) = delete;
+
+    // out must be empty (otherwise InvalidArgument). On failure out stays
+    // empty and no descriptor is left open. syscalls must outlive out.
+    static Status Open(const std::filesystem::path& path,
+                       PosixSyscalls& syscalls,
+                       std::unique_ptr<RandomAccessFile>& out);
+
+    std::uint64_t size() const {
+        return size_;
+    }
+
+    const std::string& path() const {
+        return path_;
+    }
+
+    // Reads exactly n bytes at offset into dst, accepting short reads and
+    // retrying EINTR. End of file before n bytes, or any other read error,
+    // returns IOError; dst may then hold a partial result.
+    Status Read(std::uint64_t offset, std::size_t n, char* dst) const;
+
+    // Releases the descriptor; returns IOError if close fails. Later
+    // calls return Ok without effect.
+    Status Close();
+
+private:
+    RandomAccessFile(std::string path, PosixSyscalls& syscalls)
+        : path_(std::move(path)), syscalls_(&syscalls) {}
+
+    std::string path_;
+    PosixSyscalls* syscalls_;
+    int fd_ = -1;
+    std::uint64_t size_ = 0;
+};
 
 }  // namespace kv
