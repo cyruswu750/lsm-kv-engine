@@ -26,7 +26,7 @@ affecting correctness, recovery, or data integrity.
 - Fix: Validate all header fields before the length check. Commit 8bddb8c.
 - Regression test: the two tests above.
 
-## B-003: Writable-file factories accepted embedded NUL paths
+## B-003: Writable-file factories accepted embedded NUL paths (2026-11-01)
 
 - Symptom: A path containing `abc\0suffix` was accepted.
   NewWritableFile created `abc`; OpenAppendableFile returned a writable
