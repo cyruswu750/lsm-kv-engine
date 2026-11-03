@@ -39,7 +39,7 @@ Same trace (overwrites, 10% deletes), same fresh initial state, same final opera
 | 8 | 140 [139, 164] | 140 [139, 164] | 6937.3 [6653.8, 7026.9] | 10196.8 [9594.0, 10983.4] | 101553.4 [92553.9, 187192.1] | 4.199 [4.199, 4.199] | 0.0046 [0.0046, 0.0046] | 1316872 [1316872, 1316872] | 6 [6, 6] | 6 [6, 6] | 41 [41, 41] | 5 [5, 5] | 5.321 [5.321, 5.321] |
 | disabled | 140 [139, 141] | 140 [139, 141] | 6981.5 [6942.9, 7024.4] | 9987.1 [9773.8, 10516.8] | 59273.7 [56985.4, 151969.1] | 2.418 [2.418, 2.418] | 0.0144 [0.0144, 0.0144] | 2454265 [2454265, 2454265] | 41 [41, 41] | 41 [41, 41] | 41 [41, 41] | 0 [0, 0] | 18.221 [18.221, 18.221] |
 
-Latency caveat for this table and threshold_p99.svg: Synchronous latency drifted with time during this run, not with the threshold: insert p50 was about 4.5 ms in the first two runs (20:36-20:38) and 6.6-7.0 ms in all ten runs from 20:39 on; the cause was not measured. These latency and throughput figures therefore cannot establish the causal effect of the threshold on latency. Per-run values: NOTES.md.
+Latency caveat for this table and threshold_p99.svg: Synchronous latency varied over time during this run; the cause was not isolated: insert p50 was about 4.5 ms in the first two runs (20:36-20:38) and 6.6-7.0 ms in all ten runs from 20:39 on; the cause was not measured. These latency and throughput figures therefore cannot establish the causal effect of the threshold on latency. Per-run values: NOTES.md.
 
 Clock overhead per timed call (median of 10,001 back-to-back steady_clock pairs, per run): 20.0 ns [20, 20] over 24 runs. It is included in every latency above and matters only for sub-microsecond calls.
 

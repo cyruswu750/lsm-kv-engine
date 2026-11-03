@@ -1,4 +1,4 @@
-Synchronous latency drifted with time during this run, not with the threshold:
+Synchronous latency varied over time during this run; the cause was not isolated:
 insert p50 was about 4.5 ms in the first two runs (20:36-20:38) and 6.6-7.0 ms
 in all ten runs from 20:39 on; the cause was not measured. These latency and
 throughput figures therefore cannot establish the causal effect of the

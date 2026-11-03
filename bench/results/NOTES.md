@@ -14,13 +14,14 @@ only the clock-overhead sentence and the threshold latency caveat
 
 ## Observed variation in synchronous runs
 
-Synchronous latency changed with time, not with the configuration. The
+Synchronous latency varied over time during this run; the cause was not
+isolated. The
 first run (20:30) had a p50 of 6.7 ms, the next five (20:33-20:38) about
 4.5 ms, and every synchronous run from 20:39 on about 7.0 ms, whatever
 its threshold. The
 cause was not measured (the WSL2 virtual disk and the host are the likely
 contributors). Consequently, the group 4 throughput and p50/p99 columns
-mostly reflect when each run happened and must not be read as threshold
+are confounded with when each run happened and must not be read as threshold
 effects: they cannot establish the causal effect of the threshold on
 latency. The threshold comparison rests on the deterministic columns
 (write amplification, database size, runs, SSTs, candidates per lookup),
