@@ -6,7 +6,13 @@ Usage: summarize_bench.py <results dir>
 
 Only runs recorded in raw/<group>.jsonl (exit 0 and ok=true) are used;
 raw/failures.jsonl is listed separately and never summarized.
+
+If <results dir>/threshold_caveat.txt exists, its non-empty lines are a
+limitation of that run's group 4 latencies. They are printed right after
+the group 4 table and as footnotes inside threshold_p99.svg, so the chart
+carries them when viewed alone. Measurements are never changed.
 """
+import html
 import json
 import os
 import statistics
@@ -48,9 +54,12 @@ def per_get(result, prefix, field):
     return stats[field] / stats["gets"] if stats["gets"] else None
 
 
-def svg_bars(path, title, unit, groups):
-    """groups: list of (label, (median, lo, hi, n))."""
+def svg_bars(path, title, unit, groups, notes=()):
+    """groups: list of (label, (median, lo, hi, n)); notes: footnote lines
+    drawn below the chart."""
     width, height, left, bottom, top = 640, 320, 70, 60, 40
+    chart_height = height
+    height += 16 * len(notes)
     vals = [g[1] for g in groups if g[1] is not None]
     peak = max(v[2] for v in vals) if vals else 1
     peak = peak if peak > 0 else 1
@@ -60,7 +69,8 @@ def svg_bars(path, title, unit, groups):
              '<rect width="100%" height="100%" fill="white"/>',
              '<text x="%d" y="20" font-size="14">%s</text>' % (left, title),
              '<text x="10" y="%d" transform="rotate(-90 10,%d)">%s</text>'
-             % (height // 2, height // 2, unit)]
+             % (chart_height // 2, chart_height // 2, unit)]
+    height = chart_height
     plot_h = height - bottom - top
     for i, (label, s) in enumerate(groups):
         x = left + i * bar_w + bar_w * 0.15
@@ -85,6 +95,9 @@ def svg_bars(path, title, unit, groups):
                  % (left, top + plot_h, width - 10, top + plot_h))
     parts.append('<text x="%d" y="%d">bars: median; lines: min to max of '
                  'the repetitions</text>' % (left, height - 10))
+    for i, note in enumerate(notes):
+        parts.append('<text x="10" y="%d" font-size="11">%s</text>'
+                     % (height + 10 + 16 * i, html.escape(note)))
     parts.append("</svg>")
     with open(path, "w") as f:
         f.write("\n".join(parts) + "\n")
@@ -243,6 +256,14 @@ def main():
                 fmt(stat([per_get(r, "verify_read_", "candidate_ssts")
                           for r in rs]), 1, 3)))
         lines.append("")
+        caveat = []
+        caveat_path = os.path.join(out_dir, "threshold_caveat.txt")
+        if os.path.exists(caveat_path):
+            with open(caveat_path) as f:
+                caveat = [l.strip() for l in f if l.strip()]
+        if caveat:
+            lines += ["Latency caveat for this table and threshold_p99.svg: " +
+                      " ".join(caveat), ""]
         names = {"trigger_2": "2", "trigger_4": "4", "trigger_8": "8",
                  "trigger_0": "off"}
         svg_bars(os.path.join(out_dir, "threshold_write_amp.svg"),
@@ -252,7 +273,8 @@ def main():
         svg_bars(os.path.join(out_dir, "threshold_p99.svg"),
                  "Insert p99 by run threshold (includes maintenance)", "us",
                  [(names[l], stat([r["insert_p99_ns"] / 1e3
-                                   for r in th.get(l, [])])) for l in order])
+                                   for r in th.get(l, [])])) for l in order],
+                 notes=caveat)
         svg_bars(os.path.join(out_dir, "threshold_candidates.svg"),
                  "SST candidates per lookup after the trace", "SSTs / Get",
                  [(names[l], stat([per_get(r, "verify_read_", "candidate_ssts")
