@@ -19,7 +19,8 @@ Verification status of the M2 code (commit c6a410f):
   ASan and UBSan, 400 tests passed).
 - Local: the same 400 tests passed in a Debug ASan/UBSan build with test
   data on ext4, with no skipped or disabled tests.
-- Not yet done: the owner's review of M2 and the `v0.2-m2` release tag.
+- Release tag: `v0.2-m2` (annotated) is on `6d702e4`; the commits
+  after `c6a410f` change documentation only.
 
 ## Status: M2 (SSTables, synchronous flush, manifest)
 
