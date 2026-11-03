@@ -34,6 +34,7 @@ add_library(kv STATIC
     src/core/sst.cc
     src/core/manifest.cc
     src/core/compaction.cc
+    src/core/bloom.cc
     src/core/db.cc
 )
 

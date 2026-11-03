@@ -114,4 +114,68 @@ inline std::string RawSst(const std::vector<std::vector<RawSstEntry>>& blocks) {
     return data + index_bytes + RawFooterBytes(footer);
 }
 
+// ---- Version 2 (with a Bloom filter, docs/sst-format.md section 3.7) ----
+// KVHASH1 and the filter are written here independently of
+// src/core/bloom.cc; their golden vectors come from
+// scripts/bloom_reference.py.
+
+inline std::uint64_t RawFnv1a64(std::string_view key) {
+    std::uint64_t h = 14695981039346656037ull;  // 0xcbf29ce484222325
+    for (unsigned char c : key) {
+        h = (h ^ c) * 1099511628211ull;  // 0x100000001b3
+    }
+    return h;
+}
+
+inline std::uint64_t RawMix64(std::uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+struct RawFilter {
+    std::uint32_t filter_version = 1;
+    std::uint32_t hash_id = 1;
+    std::uint32_t key_count = 0;
+    std::uint32_t probes = 0;
+    std::string bits;
+    bool corrupt_crc = false;
+};
+
+// The filter the format prescribes for keys at bits_per_key.
+inline RawFilter RawFilterFor(const std::vector<std::string>& keys,
+                              std::uint32_t bits_per_key = 10) {
+    RawFilter f;
+    f.key_count = static_cast<std::uint32_t>(keys.size());
+    std::uint32_t k = (bits_per_key * 69 + 50) / 100;
+    f.probes = k < 1 ? 1 : (k > 30 ? 30 : k);
+    std::size_t bytes = (keys.size() * bits_per_key + 7) / 8;
+    if (bytes < 8) {
+        bytes = 8;
+    }
+    f.bits.assign(bytes, '\0');
+    const std::uint64_t m = 8 * bytes;
+    for (const std::string& key : keys) {
+        const std::uint64_t a = RawFnv1a64(key);
+        const std::uint64_t h1 = RawMix64(a);
+        const std::uint64_t h2 = RawMix64(a ^ 0x9e3779b97f4a7c15ull) | 1;
+        for (std::uint32_t i = 0; i < f.probes; ++i) {
+            const std::uint64_t b = (h1 + i * h2) % m;
+            f.bits[b / 8] = static_cast<char>(f.bits[b / 8] | (1 << (b % 8)));
+        }
+    }
+    return f;
+}
+
+inline std::string RawFilterBytes(const RawFilter& f) {
+    std::string out;
+    AppendLE(out, f.filter_version, 4);
+    AppendLE(out, f.hash_id, 4);
+    AppendLE(out, f.key_count, 4);
+    AppendLE(out, f.probes, 4);
+    out += f.bits;
+    AppendLE(out, RefCrc32c(out) ^ (f.corrupt_crc ? 1u : 0u), 4);
+    return out;
+}
+
 }  // namespace kv::test
