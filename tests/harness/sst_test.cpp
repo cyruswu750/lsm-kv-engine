@@ -58,6 +58,24 @@ constexpr char kGoldenSst[] =
     "\x00\x01\x00\x00\x00\x4b\x56\x53\x53\x54\x30\x30\x31";
 const std::string kGolden(kGoldenSst, sizeof(kGoldenSst) - 1);
 
+// The same entries as SST version 2 (docs/sst-format.md section 3.7),
+// computed by scripts/bloom_reference.py: the same data block and index,
+// a 28-byte filter (n = 4, k = 7, 64 bits), and a version 2 footer.
+constexpr char kGoldenSstV2[] =
+    "\x02\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00"
+    "\x01\x00\xff\x01\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00"
+    "\x00\x00\x00\x00\x01\x61\x68\x69\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x05\x00\x00\x00\x00\x00\x00\x00\x02\x62\x01\x00\x00\x00\x00\x00"
+    "\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x63\x04\x00\x00\x00"
+    "\xc4\x69\x24\x1b\x01\x00\x00\x00\x01\x00\x00\x00\x04\x00\x00\x00"
+    "\x07\x00\x00\x00\x25\x42\xae\x31\x18\x4e\x82\x49\xf0\x9e\xc4\x7e"
+    "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x54\x00\x00\x00"
+    "\x63\x01\x00\x00\x00\xa8\xb0\xd9\x00\xe2\x26\x46\x67\x70\x00\x00"
+    "\x00\x00\x00\x00\x00\x19\x00\x00\x00\x00\x00\x00\x00\x54\x00\x00"
+    "\x00\x00\x00\x00\x00\x1c\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00"
+    "\x00\x4b\x56\x53\x53\x54\x30\x30\x31";
+const std::string kGoldenV2(kGoldenSstV2, sizeof(kGoldenSstV2) - 1);
+
 std::vector<RawSstEntry> GoldenEntries() {
     return {
         {std::string("\x00\xff", 2), 2, test::kRawPut, "\x01"},
@@ -72,11 +90,13 @@ protected:
     fs::path Path() const { return tmp_.path() / "t.sst"; }
 
     // Writes entries through the production builder; returns the bytes.
-    std::string Build(const std::vector<RawSstEntry>& entries) {
+    // bits_per_key 0 writes version 1; the default writes version 2.
+    std::string Build(const std::vector<RawSstEntry>& entries,
+                      std::uint32_t bits_per_key = kDefaultBloomBitsPerKey) {
         fs::remove(Path());
         std::unique_ptr<WritableFile> file;
         EXPECT_TRUE(NewWritableFile(Path(), file).ok());
-        SstBuilder builder(*file);
+        SstBuilder builder(*file, {}, bits_per_key);
         for (const RawSstEntry& e : entries) {
             const Status s = builder.Add(e.key, e.sequence,
                                          static_cast<ValueType>(e.type),
@@ -158,9 +178,26 @@ Probe Get(const SstTable& table, std::string_view key) {
 // ---- Golden vector and round trip -----------------------------------------
 
 TEST_F(SstTest, ProductionAndTestBuildersMatchGoldenBytes) {
-    EXPECT_EQ(Build(GoldenEntries()), kGolden);
+    EXPECT_EQ(Build(GoldenEntries(), 0), kGolden);
     EXPECT_EQ(RawSst({GoldenEntries()}), kGolden);
     EXPECT_EQ(kGolden.size(), kMinSstFileSize + 60);
+
+    // Version 2: the default writer.
+    EXPECT_EQ(Build(GoldenEntries()), kGoldenV2);
+    EXPECT_EQ(test::RawSstV2({GoldenEntries()}), kGoldenV2);
+    EXPECT_EQ(kGoldenV2.size(), kGolden.size() + 28);
+}
+
+TEST_F(SstTest, VersionTwoGoldenOpensAndAnswersLookups) {
+    std::unique_ptr<SstTable> table;
+    ASSERT_TRUE(OpenBytes(kGoldenV2, table).ok());
+    EXPECT_EQ(table->summary().version, kSstVersion2);
+    ASSERT_FALSE(table->summary().filter.empty());
+    EXPECT_EQ(table->summary().filter.key_count(), 4u);
+    EXPECT_EQ(Get(*table, "a").value, "hi");
+    EXPECT_EQ(Get(*table, "b").result, LookupResult::kDeleted);
+    EXPECT_EQ(Get(*table, std::string("\x00\xff", 2)).value, "\x01");
+    EXPECT_EQ(Get(*table, "bb").result, LookupResult::kAbsent);
 }
 
 TEST_F(SstTest, GoldenFileOpensAndAnswersLookups) {
@@ -457,8 +494,11 @@ TEST_F(SstTest, MalformedFooterFieldsFailClosed) {
         return Assemble(block, index, &f);
     };
 
+    ExpectOpenFails(with([](RawFooter& f) { f.version = 3; }),
+                    Code::UnsupportedFormat, "unsupported SST version 3");
+    // Version 2 must have a filter region.
     ExpectOpenFails(with([](RawFooter& f) { f.version = 2; }),
-                    Code::UnsupportedFormat, "unsupported SST version 2");
+                    Code::Corruption, "filter length 0");
     ExpectOpenFails(with([](RawFooter& f) { f.version = 0; }),
                     Code::UnsupportedFormat, "version 0");
     ExpectOpenFails(with([](RawFooter& f) { f.magic = "KVSST002"; }),

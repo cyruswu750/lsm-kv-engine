@@ -9,7 +9,7 @@
 
 namespace kv::test {
 
-// Builds SST version 1 bytes (docs/sst-format.md section 3) without the
+// Builds SST version 1 and 2 bytes (docs/sst-format.md section 3) without the
 // production codec, CRC, or little-endian helpers. Each layer exposes its
 // fields so tests can craft malformed files with correct checksums.
 
@@ -176,6 +176,39 @@ inline std::string RawFilterBytes(const RawFilter& f) {
     out += f.bits;
     AppendLE(out, RefCrc32c(out) ^ (f.corrupt_crc ? 1u : 0u), 4);
     return out;
+}
+
+// data + filter + index + a version 2 footer with consistent regions.
+inline std::string AssembleV2(const std::string& data,
+                              const std::string& filter,
+                              const std::string& index) {
+    RawFooter footer;
+    footer.version = 2;
+    footer.filter_offset = data.size();
+    footer.filter_length = filter.size();
+    footer.index_offset = data.size() + filter.size();
+    footer.index_length = index.size();
+    return data + filter + index + RawFooterBytes(footer);
+}
+
+// A valid version 2 SST: one block per inner vector, a filter of every
+// key at bits_per_key, a matching index and footer.
+inline std::string RawSstV2(const std::vector<std::vector<RawSstEntry>>& blocks,
+                            std::uint32_t bits_per_key = 10) {
+    std::string data;
+    std::vector<RawIndexEntry> index;
+    std::vector<std::string> keys;
+    for (const auto& block : blocks) {
+        const std::string bytes = RawBlock(block);
+        index.push_back({block.back().key, data.size(),
+                         static_cast<std::uint32_t>(bytes.size())});
+        data += bytes;
+        for (const RawSstEntry& e : block) {
+            keys.push_back(e.key);
+        }
+    }
+    return AssembleV2(data, RawFilterBytes(RawFilterFor(keys, bits_per_key)),
+                      RawIndexBytes(index));
 }
 
 }  // namespace kv::test

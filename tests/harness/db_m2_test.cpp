@@ -33,6 +33,7 @@ using test::RawManifest;
 using test::RawManifestSst;
 using test::RawRecord;
 using test::RawSst;
+using test::RawSstV2;
 using test::RawSstEntry;
 using test::RawSstName;
 using test::RawWalName;
@@ -185,7 +186,7 @@ TEST_F(DBM2Test, FlushPublishesSstNewWalAndManifest) {
     EXPECT_EQ(Entries(Db()),
               (std::vector<std::string>{"LOCK", "MANIFEST", "sst-000002.sst",
                                         "wal-000003.log"}));
-    const std::string sst = RawSst({{{"a", 1, kRawPut, "1"}}});
+    const std::string sst = RawSstV2({{{"a", 1, kRawPut, "1"}}});
     EXPECT_EQ(ReadBytesOrEmpty(Db() / "sst-000002.sst"), sst);
     EXPECT_EQ(ReadBytesOrEmpty(Db() / "wal-000003.log"),
               WalFileHeaderBytes() + RawRecord(2, kRawPut, "b", "2"));
@@ -219,7 +220,7 @@ TEST_F(DBM2Test, FlushWritesEveryMemtableEntryIncludingTombstones) {
     db = MustOpen(1);
     ASSERT_TRUE(db->Put("z", "after").ok());
     EXPECT_EQ(ReadBytesOrEmpty(Db() / "sst-000002.sst"),
-              RawSst({{{"", 2, kRawPut, "empty key"},
+              RawSstV2({{{"", 2, kRawPut, "empty key"},
                        {std::string("\x00\xff", 2), 5, kRawPut, ""},
                        {"b", 4, kRawPut, "y"},
                        {"gone", 3, kRawDelete, ""}}}));
@@ -287,7 +288,7 @@ TEST_F(DBM2Test, FlushedDeleteShadowsOlderFlushedValue) {
     const RawManifest m = Manifest();
     ASSERT_EQ(m.ssts.size(), 2u);
     EXPECT_EQ(ReadBytesOrEmpty(Db() / "sst-000004.sst"),
-              RawSst({{{"k", 2, kRawDelete, ""}}}));
+              RawSstV2({{{"k", 2, kRawDelete, ""}}}));
     EXPECT_EQ(Lookup(*db, "k"), std::nullopt);
     db.reset();
     for (int round = 0; round < 2; ++round) {
@@ -644,15 +645,16 @@ TEST_F(DBM2ReferenceTest, DamagedReferencedSstFailsOpen) {
     flipped[3] ^= 0x10;
     ASSERT_TRUE(WriteBytes(Sst(), flipped));
     ExpectOpenFailsUnchanged(Code::Corruption, "sst-000004.sst");
-    std::string v2 = sst_;
-    v2[v2.size() - 12] = 2;
-    ASSERT_TRUE(WriteBytes(Sst(), v2));
-    ExpectOpenFailsUnchanged(Code::UnsupportedFormat, "SST version 2");
+    // The engine writes SST version 2 (M4); version 3 is unknown.
+    std::string v3 = sst_;
+    v3[v3.size() - 12] = 3;
+    ASSERT_TRUE(WriteBytes(Sst(), v3));
+    ExpectOpenFailsUnchanged(Code::UnsupportedFormat, "SST version 3");
 }
 
 // A valid SST whose actual sequences differ from the manifest's record.
 TEST_F(DBM2ReferenceTest, SstSequenceRangeMustMatchManifest) {
-    const std::string other = RawSst({{{"b", 3, kRawPut, "2"}}});
+    const std::string other = RawSstV2({{{"b", 3, kRawPut, "2"}}});
     ASSERT_EQ(other.size(), sst_.size());
     ASSERT_TRUE(WriteBytes(Sst(), other));
     ExpectOpenFailsUnchanged(Code::Corruption,

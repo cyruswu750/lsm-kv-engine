@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <utility>
 
+#include "bloom.h"
 #include "coding.h"
 #include "crc32c.h"
 
@@ -113,9 +114,21 @@ Status ParseBlock(std::string_view block, std::vector<SstEntry>& out) {
 }
 
 struct Footer {
+    std::uint32_t version = 0;
+    std::uint64_t data_end = 0;  // the data region size D
+    std::uint64_t filter_offset = 0;
+    std::uint64_t filter_length = 0;
     std::uint64_t index_offset = 0;
     std::uint64_t index_length = 0;
 };
+
+std::string Regions(const Footer& f, std::uint64_t file_size) {
+    return "filter offset " + std::to_string(f.filter_offset) +
+           ", filter length " + std::to_string(f.filter_length) +
+           ", index offset " + std::to_string(f.index_offset) +
+           ", index length " + std::to_string(f.index_length) +
+           ", file size " + std::to_string(file_size);
+}
 
 Status DecodeFooter(std::string_view footer,
                     std::uint64_t file_size,
@@ -124,7 +137,7 @@ Status DecodeFooter(std::string_view footer,
         return Status::Corruption("footer has bad magic");
     }
     const std::uint32_t version = DecodeFixed32(footer.data() + 36);
-    if (version != kSstVersion) {
+    if (version != kSstVersion1 && version != kSstVersion2) {
         return Status::UnsupportedFormat("unsupported SST version " +
                                          std::to_string(version));
     }
@@ -133,23 +146,41 @@ Status DecodeFooter(std::string_view footer,
     }
 
     Footer f;
+    f.version = version;
     f.index_offset = DecodeFixed64(footer.data() + 4);
     f.index_length = DecodeFixed64(footer.data() + 12);
-    const std::uint64_t filter_offset = DecodeFixed64(footer.data() + 20);
-    const std::uint64_t filter_length = DecodeFixed64(footer.data() + 28);
-    if (filter_offset != 0 || filter_length != 0) {
-        return Status::Corruption("version 1 footer has a filter region");
-    }
+    f.filter_offset = DecodeFixed64(footer.data() + 20);
+    f.filter_length = DecodeFixed64(footer.data() + 28);
 
-    // file_size >= kMinSstFileSize was checked by the caller.
+    // file_size >= kMinSstFileSize was checked by the caller. Each operand
+    // is checked against before_footer first, so no sum can overflow.
     const std::uint64_t before_footer = file_size - kSstFooterSize;
-    if (f.index_offset < kMinSstBlockSize || f.index_offset > before_footer ||
-        f.index_length != before_footer - f.index_offset) {
-        return Status::Corruption(
-            "footer regions are inconsistent: index offset " +
-            std::to_string(f.index_offset) + ", index length " +
-            std::to_string(f.index_length) + ", file size " +
-            std::to_string(file_size));
+    bool consistent;
+    if (version == kSstVersion1) {
+        if (f.filter_offset != 0 || f.filter_length != 0) {
+            return Status::Corruption("version 1 footer has a filter region");
+        }
+        f.data_end = f.index_offset;
+        consistent = f.index_offset >= kMinSstBlockSize &&
+                     f.index_offset <= before_footer &&
+                     f.index_length == before_footer - f.index_offset;
+    } else {
+        if (f.filter_length < kMinSstFilterSize ||
+            f.filter_length > kMaxSstFilterSize) {
+            return Status::Corruption("filter length " +
+                                      std::to_string(f.filter_length) +
+                                      " is out of range");
+        }
+        f.data_end = f.filter_offset;
+        consistent = f.filter_offset >= kMinSstBlockSize &&
+                     f.filter_offset <= before_footer &&
+                     f.filter_length <= before_footer - f.filter_offset &&
+                     f.index_offset == f.filter_offset + f.filter_length &&
+                     f.index_length == before_footer - f.index_offset;
+    }
+    if (!consistent) {
+        return Status::Corruption("footer regions are inconsistent: " +
+                                  Regions(f, file_size));
     }
     if (f.index_length < kMinSstIndexSize) {
         return Status::Corruption("index length " +
@@ -161,7 +192,7 @@ Status DecodeFooter(std::string_view footer,
     // most kSstIndexEntryHeaderSize + kMaxKeyLength bytes. Capping the
     // block count first keeps the product far below 2^64.
     const std::uint64_t max_blocks = std::min<std::uint64_t>(
-        f.index_offset / kMinSstBlockSize, kMaxSstBlocks);
+        f.data_end / kMinSstBlockSize, kMaxSstBlocks);
     const std::uint64_t max_index = std::min<std::uint64_t>(
         max_blocks * (kSstIndexEntryHeaderSize + kMaxKeyLength) +
             kSstIndexTrailerSize,
@@ -170,15 +201,16 @@ Status DecodeFooter(std::string_view footer,
         return Status::Corruption(
             "index length " + std::to_string(f.index_length) +
             " exceeds the limit " + std::to_string(max_index) +
-            " for a data region of " + std::to_string(f.index_offset) +
+            " for a data region of " + std::to_string(f.data_end) +
             " bytes");
     }
     out = f;
     return Status::Ok();
 }
 
-// Validates the index block. data_end is the footer's index_offset; the
-// blocks must tile [0, data_end) exactly.
+// Validates the index block. data_end is the data region size (the
+// filter offset in version 2, the index offset in version 1); the blocks
+// must tile [0, data_end) exactly.
 Status DecodeIndex(std::string_view index,
                    std::uint64_t data_end,
                    std::vector<SstBlockHandle>& out) {
@@ -287,10 +319,15 @@ Status ReadBlock(const RandomAccessFile& file,
 
 }  // namespace
 
-SstBuilder::SstBuilder(WritableFile& file, SstLimits limits)
+SstBuilder::SstBuilder(WritableFile& file,
+                       SstLimits limits,
+                       std::uint32_t bloom_bits_per_key)
     : file_(file),
       limits_{std::min(limits.max_blocks, kMaxSstBlocks),
-              std::min(limits.max_index_size, kMaxSstIndexSize)} {}
+              std::min(limits.max_index_size, kMaxSstIndexSize),
+              std::min(limits.max_filter_keys, kMaxSstFilterKeys)},
+      bits_per_key_(std::min(bloom_bits_per_key, kMaxFilterBitsPerKey)),
+      filter_(std::max<std::uint32_t>(bits_per_key_, 1)) {}
 
 Status SstBuilder::Add(std::string_view key,
                        std::uint64_t sequence,
@@ -314,6 +351,11 @@ Status SstBuilder::Add(std::string_view key,
     }
     if (has_entries_ && !BytewiseLess{}(last_key_, key)) {
         return Status::InvalidArgument("SST keys must be strictly increasing");
+    }
+    if (bits_per_key_ > 0 && filter_.key_count() >= limits_.max_filter_keys) {
+        return Status::InvalidArgument(
+            "SST would exceed " + std::to_string(limits_.max_filter_keys) +
+            " filter keys");
     }
 
     const std::size_t size = kSstEntryHeaderSize + key.size() + value.size();
@@ -341,6 +383,9 @@ Status SstBuilder::Add(std::string_view key,
     summary_.max_sequence = std::max(summary_.max_sequence, sequence);
     last_key_.assign(key);
     has_entries_ = true;
+    if (bits_per_key_ > 0) {
+        filter_.AddKey(key);
+    }
     return Status::Ok();
 }
 
@@ -359,7 +404,9 @@ bool SstBuilder::CanAdd(std::string_view key, std::string_view value) const {
         index_size += kSstIndexEntryHeaderSize + last_key_.size();
     }
     return blocks <= limits_.max_blocks &&
-           index_size <= limits_.max_index_size;
+           index_size <= limits_.max_index_size &&
+           (bits_per_key_ == 0 ||
+            filter_.key_count() < limits_.max_filter_keys);
 }
 
 // Checks the limits before the block is written, so the index never grows
@@ -420,23 +467,40 @@ Status SstBuilder::Finish() {
     PutFixed32(&index, static_cast<std::uint32_t>(summary_.index.size()));
     PutFixed32(&index, Crc32c(index));
 
+    // Version 2 places the filter between the data blocks and the index.
+    std::string filter;
+    if (bits_per_key_ > 0) {
+        filter_.Encode(&filter);
+        s = BloomFilter::Decode(filter, offset_, summary_.filter);
+        if (!s.ok()) {
+            return s;
+        }
+    }
+    const std::uint64_t index_offset = offset_ + filter.size();
+
     std::string footer(4, '\0');
-    PutFixed64(&footer, offset_);
+    PutFixed64(&footer, index_offset);
     PutFixed64(&footer, index.size());
-    PutFixed64(&footer, 0);  // filter offset: none in version 1
-    PutFixed64(&footer, 0);  // filter length
-    PutFixed32(&footer, kSstVersion);
+    PutFixed64(&footer, filter.empty() ? 0 : offset_);  // 0: version 1
+    PutFixed64(&footer, filter.size());
+    PutFixed32(&footer, filter.empty() ? kSstVersion1 : kSstVersion2);
     footer.append(kSstMagic);
     EncodeFixed32(footer.data(), Crc32c(std::string_view(footer).substr(4)));
 
-    s = file_.Append(index);
+    if (!filter.empty()) {
+        s = file_.Append(filter);
+    }
+    if (s.ok()) {
+        s = file_.Append(index);
+    }
     if (s.ok()) {
         s = file_.Append(footer);
     }
     if (!s.ok()) {
         return s;
     }
-    summary_.file_size = offset_ + index.size() + footer.size();
+    summary_.version = filter.empty() ? kSstVersion1 : kSstVersion2;
+    summary_.file_size = index_offset + index.size() + footer.size();
     finished_ = true;
     return Status::Ok();
 }
@@ -489,6 +553,31 @@ Status SstTable::Open(const std::filesystem::path& path,
         return WithPath(name, s);
     }
 
+    SstSummary summary;
+    summary.version = f.version;
+    if (f.version == kSstVersion2) {
+        // The header's bounds are checked before the bit array is
+        // allocated; DecodeFooter bounded filter_length.
+        std::string header(kFilterHeaderSize, '\0');
+        s = file->Read(f.filter_offset, header.size(), header.data());
+        if (!s.ok()) {
+            return s;
+        }
+        s = BloomFilter::CheckHeader(header, f.filter_length, f.data_end);
+        if (!s.ok()) {
+            return WithPath(name, s);
+        }
+        std::string block(static_cast<std::size_t>(f.filter_length), '\0');
+        s = file->Read(f.filter_offset, block.size(), block.data());
+        if (!s.ok()) {
+            return s;
+        }
+        s = BloomFilter::Decode(block, f.data_end, summary.filter);
+        if (!s.ok()) {
+            return WithPath(name, s);
+        }
+    }
+
     // DecodeFooter bounded index_length by the data region and
     // kMaxSstIndexSize.
     std::string index(static_cast<std::size_t>(f.index_length), '\0');
@@ -496,8 +585,7 @@ Status SstTable::Open(const std::filesystem::path& path,
     if (!s.ok()) {
         return s;
     }
-    SstSummary summary;
-    s = DecodeIndex(index, f.index_offset, summary.index);
+    s = DecodeIndex(index, f.data_end, summary.index);
     if (!s.ok()) {
         return WithPath(name, s);
     }
@@ -506,6 +594,7 @@ Status SstTable::Open(const std::filesystem::path& path,
     std::string buffer;
     std::string previous_key;
     bool first = true;
+    std::uint64_t entry_count = 0;
     for (const SstBlockHandle& handle : summary.index) {
         std::vector<SstEntry> entries;
         s = ReadBlock(*file, handle, buffer, entries);
@@ -519,6 +608,16 @@ Status SstTable::Open(const std::filesystem::path& path,
                                       "previous block's last key");
         }
         for (const SstEntry& entry : entries) {
+            // A filter that would deny a stored key is damaged; it must
+            // never be used as a negative answer.
+            if (!summary.filter.empty() &&
+                !summary.filter.MayContain(entry.key)) {
+                return Status::Corruption(name + ": " +
+                                          BlockContext(handle.offset) +
+                                          "the filter does not contain a "
+                                          "stored key");
+            }
+            ++entry_count;
             if (first) {
                 summary.smallest_key.assign(entry.key);
                 summary.min_sequence = entry.sequence;
@@ -533,6 +632,14 @@ Status SstTable::Open(const std::filesystem::path& path,
         previous_key.assign(entries.back().key);
     }
 
+    if (!summary.filter.empty() &&
+        entry_count != summary.filter.key_count()) {
+        return Status::Corruption(
+            name + ": the filter counts " +
+            std::to_string(summary.filter.key_count()) + " keys, but the SST "
+            "holds " + std::to_string(entry_count));
+    }
+
     s = file->Close();
     if (!s.ok()) {
         return s;
@@ -544,16 +651,37 @@ Status SstTable::Open(const std::filesystem::path& path,
 
 Status SstTable::Get(std::string_view key,
                      LookupResult& result,
-                     std::string* value) const {
+                     std::string* value,
+                     SstReadStats* stats,
+                     bool use_filter) const {
     const auto& index = summary_.index;
+    if (BytewiseLess{}(key, summary_.smallest_key) ||
+        BytewiseLess{}(summary_.largest_key(), key)) {
+        if (stats != nullptr) {
+            ++stats->range_rejections;
+        }
+        result = LookupResult::kAbsent;
+        return Status::Ok();
+    }
+    // Every stored key, tombstones included, is in the filter, so a
+    // negative answer proves this SST holds no version of the key.
+    if (use_filter && !summary_.filter.empty() &&
+        !summary_.filter.MayContain(key)) {
+        if (stats != nullptr) {
+            ++stats->filter_rejections;
+        }
+        result = LookupResult::kAbsent;
+        return Status::Ok();
+    }
+    // key <= the largest key, so some block's last key is >= key.
     const auto it = std::lower_bound(
         index.begin(), index.end(), key,
         [](const SstBlockHandle& handle, std::string_view k) {
             return BytewiseLess{}(handle.last_key, k);
         });
-    if (it == index.end() || BytewiseLess{}(key, summary_.smallest_key)) {
-        result = LookupResult::kAbsent;
-        return Status::Ok();
+    if (stats != nullptr) {
+        ++stats->block_reads;
+        stats->block_bytes += it->length;
     }
 
     std::unique_ptr<RandomAccessFile> file;
