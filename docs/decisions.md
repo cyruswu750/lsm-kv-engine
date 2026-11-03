@@ -66,7 +66,8 @@ or measurable performance. Update validation status as tests are added.
   publication code unchanged, with faults isolated to one object.
 - Cost: `open`, `mkdir`, `rename`, `unlink`, `flock`, and directory
   listing always use real syscalls, so rename failure is not injected.
-  A forgotten seam argument silently falls back to real I/O.
+  A forgotten seam argument silently falls back to real I/O. (M2: D-014
+  moves open, rename, unlink, pread, and fstat behind the seam.)
 - Validation: `DBFaultTest.*` and `TornTail.*`.
 
 ## D-005: Classify database entries with lstat and scan twice
@@ -121,5 +122,238 @@ or measurable performance. Update validation status as tests are added.
   bytes into the memtable, which keeps M1 recovery simple.
 - Cost: Peak recovery memory is about twice the WAL size (buffer plus
   memtable copies). Recovery is not bounded-memory for arbitrarily large
-  WALs; M2 flush and WAL retirement are expected to bound WAL size.
+  WALs. In M2 a flush retires the WAL whenever the memtable reaches
+  `memtable_bytes` before a mutation, so the active WAL holds roughly one
+  memtable's worth of records. This is still not a strict bound:
+  overwrites add WAL bytes without growing the memtable estimate.
 - Validation: None; this is a documented limitation.
+
+## D-008: Replace the manifest as one whole-file record
+
+- Decision: MANIFEST is a single checksummed record (docs/sst-format.md
+  section 4) that each publication replaces through `MANIFEST.tmp`, file
+  fsync, rename, and directory fsync. It is never appended to.
+- Alternatives: An append-only edit log with periodic snapshots (the
+  LevelDB approach).
+- Reason: The whole live state (one active WAL, an SST list without
+  levels or key ranges) is small. A single record has one validation
+  path, has no tail-repair rules, and cannot accumulate a long replay
+  history. Rename gives readers the old or the new generation, never a
+  mixture.
+- Cost: Each flush rewrites 60 + 32 x (live SSTs) bytes. Without M3
+  compaction the SST list grows with every flush. The list is capped at
+  2^20 entries; at the cap, a flush is refused (D-013).
+- Validation: `Manifest.*` (golden bytes, every truncation, every bit
+  flip, resealed invalid fields, unknown versions),
+  `PublishFaultTest.FlushOrderSyncsEachDependencyOnceBeforePublication`.
+
+## D-009: Separate M2 file names; reject M1 directories without migration
+
+- Decision: M2 files are `MANIFEST`, `wal-<id>.log`, and `sst-<id>.sst`
+  (6 to 20 digit canonical IDs), plus `.tmp` forms. A directory without
+  MANIFEST but with `000001.wal` (any kind) or a regular `000001.wal.tmp`
+  is a recognized M1 directory. Open returns UnsupportedFormat and
+  changes nothing, not even LOCK. Without MANIFEST, any regular M2 engine
+  file is interrupted-initialization residue: Corruption, preserved, and
+  never reinitialized. MANIFEST, when present, takes precedence, and M1
+  names next to it are ignored.
+- Alternatives: Reuse `000001.wal` as the first M2 WAL (an interrupted M2
+  initialization would then look like a valid M1 database). Migrate M1
+  WALs on open (more code and failure modes for a format that has no
+  users).
+- Reason: Distinct names make each state unambiguous from a listing
+  alone, and fail-closed residue handling never guesses which partial
+  initialization step happened.
+- Cost: An M1 database cannot be opened by M2. A crash during the very
+  first initialization can leave a directory that needs manual cleanup or
+  a fresh path. M1 tests that expected automatic recovery from
+  `000001.wal.tmp` now expect UnsupportedFormat or Corruption; each
+  adapted test cites the spec row.
+- Validation: `DBM2Test.ValidM1DirectoryIsUnsupportedAndUnchanged`,
+  `DBM2Test.InterruptedInitializationResidueIsPreservedCorruption`,
+  `DBM2Test.MalformedManifestIsNeverTreatedAsANewDatabase`,
+  `DBTest.UninitializedStatesFollowCreateIfMissing`,
+  `PublishFaultTest.InitializationFaultsExposeNoHandle`.
+
+## D-010: SST layout with per-block checksums and full streaming validation at Open
+
+- Decision: SST version 1 is data blocks (target 4 KiB of entries, no
+  prefix compression, CRC-32C per block), one index block (last key,
+  offset, and length per block, CRC-32C), and a 48-byte footer (CRC-32C,
+  magic, version, and zero filter fields). There is no file header. A
+  single entry larger than the target gets its own block, bounded by the
+  API limits. Open reads every referenced SST block by block and checks
+  every structural rule, key order, and the exact sequence range recorded
+  in the manifest. Get re-validates the one block it reads.
+  Amended by B-006: an SST has at most `kMaxSstBlocks` = 1,048,576
+  blocks and an index of at most `kMaxSstIndexSize` = 64 MiB, trailer
+  included. The writer checks each block as it closes it, before writing
+  it, and returns InvalidArgument at a limit. The reader rejects an
+  index_length above min(floor(index_offset / 25), 2^20) x (16 + 65,536)
+  + 8 or above 64 MiB as Corruption from the footer alone, before
+  allocating the index (docs/sst-format.md sections 3.4 and 3.6).
+- Alternatives: Validate only the footer and index at Open and trust
+  blocks until read. Keep a cached copy of whole SSTs in memory. For the
+  index: bound it only by the file size (the B-006 defect: a sparse file
+  makes any size cheap), or read it in chunks without a total limit
+  (still unbounded memory for the parsed handles). Split an oversized
+  flush into several SSTs (more publication states, out of M2 scope).
+- Reason: Corruption and sequence-range errors surface at Open with one
+  explicit rule set, and memory stays at one block plus the in-memory
+  indexes. A fixed index limit makes the largest allocation for an
+  index independent of what a file claims.
+- Cost: Open reads every live SST in full (startup I/O proportional to
+  data size). Per-block checksums are also recomputed on every Get. One
+  SST holds about 2 to 4 GiB of small entries, or 1,023 entries with
+  65,536-byte keys. The default memtable_bytes cannot reach either limit
+  (any value up to 50,266,080 cannot). A larger memtable_bytes with long
+  keys can: that flush fails in F1, the handle needs recovery, and every
+  later flush of the replayed memtable fails too, so the database stays
+  readable but refuses mutations that trigger a flush. No acknowledged
+  data is lost. M2 tests the writer limits directly, not this database
+  path end to end.
+- Validation: `SstTest.*` (golden bytes from an independent script,
+  every truncation, every bit flip, resealed malformed footer, index, and
+  blocks), `DBM2ReferenceTest.*`. Limits:
+  `SstTest.ImpossibleIndexLengthIsRejectedBeforeTheIndexIsRead`,
+  `SstTest.IndexLengthAboveTheFormatLimitIsRejectedBeforeTheIndexIsRead`,
+  `SstTest.IndexBlockCountAboveTheLimitIsCorruption` (all three failed
+  before B-006 was fixed), and the writer boundaries with lowered limits,
+  `SstTest.BuilderRefusesABlockPastTheBlockLimitBeforeWritingIt` and
+  `SstTest.BuilderIndexLimitIsExactAndCountsEachBlocksLastKey`.
+
+## D-011: Open each SST per probe instead of holding descriptors
+
+- Decision: `SstTable` keeps the validated index in memory. Each Get
+  probe opens the file read-only, preads one block, and closes it.
+- Alternatives: Keep one descriptor open per live SST.
+- Reason: Without compaction (M3), the number of SSTs grows with every
+  flush. Per-probe opens keep descriptor use constant and keep ownership
+  simple, and the M3 simulator will not need to model long-lived read
+  descriptors.
+- Cost: Each probed SST costs an extra open and close. M4 Bloom filters
+  skip most probes for missing keys. The cost is measured in M4, not
+  assumed.
+- Validation: `SstTest.ReadsGoThroughTheSyscallSeam` (one close per
+  Open and per Get, including error paths).
+
+## D-012: Publication order and the separate cleanup error classes
+
+- Decision: A flush writes and syncs the SST and the new WAL, renames
+  both, then makes both names durable with one directory sync. Only then
+  does it write, sync, and rename MANIFEST and sync the directory again
+  (docs/sst-format.md section 10). Any failure before that second sync
+  returns its error and moves the handle to NeedsRecovery. After it, the
+  in-memory state is installed without allocation. An unlink failure
+  during cleanup is not reported, and the file is retried at the next
+  publication. A cleanup directory-sync failure returns IOError and moves
+  the handle to NeedsRecovery, without retrying the sync. A close failure
+  on the already-synced old WAL is ignored.
+- Alternatives: A separate directory sync after each rename, as the
+  earlier design.md section 8 step 2 text listed (design.md now states
+  the single sync). Treating every cleanup failure as fatal. Treating
+  cleanup sync failures as nonfatal.
+- Reason: One sync covers both renames because no manifest refers to
+  either file before it completes. Unlinking an unreferenced file cannot
+  lose data. A failed directory fsync, however, may hide other lost
+  metadata, so the handle conservatively stops.
+- Cost: One fewer directory sync per flush than a sync per rename.
+  After a cleanup sync failure, the caller must reopen even though the
+  published state is durable.
+- Validation: `PublishFaultTest.EveryPublicationFailureRequiresRecovery`
+  (every syscall of F1-F5, EIO and ENOSPC, each asserting that the
+  injected fault was reached),
+  `PublishFaultTest.ExceptionBeforeOrAfterDurablePublication`,
+  `PublishFaultTest.UnlinkFailureLeavesGarbageButKeepsTheHandle`,
+  `PublishFaultTest.OldWalCloseFailureIsNotFatal`,
+  `PublishFaultTest.CleanupDirectorySyncFailureRequiresRecovery`,
+  `PublishFaultTest.FlushOrderSyncsEachDependencyOnceBeforePublication`.
+  These inject syscall results only. They do not model process
+  termination or power loss.
+
+## D-013: File-ID high-water mark, orphan retention, and counter exhaustion
+
+- Decision: Allocation starts above both the manifest's next_file_id and
+  every engine-name ID visible at Open, including temporary files,
+  orphans, and non-regular entries. Orphans below next_file_id are
+  removed at Open on a best-effort basis, after Open's directory sync has
+  made the covering manifest durable (D-016); the removals themselves are
+  not synced.
+  Orphans at or above it are kept until a published manifest covers
+  them, and that publication's cleanup removes them. File IDs (a flush
+  needs two), generations, and the SST-count cap are checked before any
+  flush I/O. Exhaustion of any of them, like sequence exhaustion (D-006),
+  returns InvalidArgument and leaves the handle usable for reads.
+- Alternatives: Delete every orphan at Open (could erase the only
+  evidence of a high ID and allow reuse after a crash). Persist a
+  high-water mark before deleting (an extra publication at Open).
+  Silently skip the flush when IDs run out (violates the memtable
+  threshold without telling the caller).
+- Reason: Published IDs and IDs observed at Open are never reused, at
+  the cost of one extra flush-time cleanup.
+- Cost: High-ID orphans occupy space until the next flush. An ID
+  allocated in a crashed session whose file vanished completely has no
+  recoverable identity and is not covered. At exhaustion, every mutation
+  that needs a flush is rejected.
+- Validation: `DBM2Test.HighIdOrphansAreKeptUntilAPublishedHighWaterCoversThem`
+  (two reopens without reuse), `DBM2Test.CoveredOrphansAreRemovedAndOthersKept`,
+  `DBM2Test.FailedOrphanRemovalAtOpenIsRetriedAfterPublication`,
+  `DBM2Test.FileIdExhaustionRejectsMutationWithoutIo`,
+  `DBM2Test.ObservedMaxIdOrphanExhaustsFileIds`,
+  `DBM2Test.GenerationExhaustionRejectsMutationWithoutIo`,
+  `DBM2Test.ExhaustedSequenceDoesNotTriggerFlush`.
+
+## D-014: Extend the syscall seam to open, pread, fstat, rename, and unlink
+
+- Decision: `PosixSyscalls` gains `Open`, `Pread`, `Fstat`, `Rename`, and
+  `Unlink`. Every WAL, SST, and manifest file operation, and the
+  descriptor opened for each directory sync, goes through it. `RenameFile`
+  and `RemoveFile` take the seam (the real syscalls by default).
+  `FaultSyscalls` records armed calls with their target file names and
+  supports rules that fail or throw on a named operation and file. This
+  extends D-004 and removes its "rename is not injected" cost.
+- Alternatives: A full virtual filesystem interface now (that belongs to
+  M3, which needs volatile and durable state).
+- Reason: Publication, cleanup, and SST read faults must run through
+  production code to be meaningful.
+- Cost: lstat, directory listing, mkdir, and the LOCK file's open and
+  flock still use real syscalls. They are listed in docs/sst-format.md
+  section 12 for the M3 simulator.
+- Validation: every `PublishFaultTest` case asserts that its rule fired.
+  `SstTest.ReadsGoThroughTheSyscallSeam`,
+  `ManifestFileTest.ReadsThroughTheSeamAndNamesThePath`.
+
+## D-015: SST read errors during Get do not invalidate the handle
+
+- Decision: A pread error or block corruption found by Get returns
+  IOError or Corruption from that Get and clears the output. The handle
+  stays usable.
+- Alternatives: Move to NeedsRecovery, as after a write failure.
+- Reason: Nothing durable or in memory changed, so the handle's state
+  still matches the published state. Write failures are different
+  because they can leave durable and in-memory state disagreeing.
+- Cost: A persistently bad SST keeps failing Gets that reach it until the
+  database is reopened (when Open's validation rejects it) or repaired.
+- Validation: `PublishFaultTest.SstReadFailureDuringGetKeepsTheHandle`,
+  `SstTest.GetRevalidatesTheBlockItReads`.
+
+## D-016: Open syncs the database directory before retiring or acknowledging
+
+- Decision: After an existing database's manifest, SSTs, and active WAL
+  are validated and replayed, Open fsyncs the database directory once.
+  Only after that does it remove orphans and expose a handle. A failure
+  returns IOError, removes nothing, and exposes no handle.
+- Alternatives: No sync at Open (the earlier M2 code). Rewriting the
+  manifest at every Open.
+- Reason: The visible MANIFEST can come from a rename whose directory
+  sync never completed: a crash between F5's rename and its sync, or a
+  failed sync that invalidated the previous handle. design.md section 8
+  step 4 forbids acknowledging operations on that generation, or deleting
+  files it superseded, until the sync completes. One directory sync
+  establishes that state without writing anything new.
+- Cost: One directory fsync per Open of an existing database. After a
+  real writeback error, a successful sync on a new descriptor still does
+  not prove that earlier lost data reached storage (design.md section 5).
+- Validation: `UnsyncedManifestTest.OpenSyncsDirectoryBeforeRetiringOrAcknowledging`,
+  `UnsyncedManifestTest.FailedOpenDirectorySyncRetiresNothing` (both
+  failed before the change; B-005).
