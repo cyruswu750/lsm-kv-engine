@@ -9,7 +9,9 @@ implementation, and its formats are intentionally not LevelDB compatible.
 The design contract is [docs/design.md](docs/design.md). The exact
 SSTable, manifest, naming, and directory-state rules are in
 [docs/sst-format.md](docs/sst-format.md); compaction and the crash
-simulator are specified in [docs/m3-design.md](docs/m3-design.md).
+simulator are specified in [docs/m3-design.md](docs/m3-design.md), and
+Bloom filters, counters, and benchmarks in
+[docs/m4-design.md](docs/m4-design.md).
 
 The badge shows the result of the latest remote CI run. Local test results
 are not a substitute for it.
@@ -34,10 +36,19 @@ Verification status of the M3 code (merge commit 2845a02):
   that tree only in two comments.
 - Release tag: `v0.3-m3` (annotated) is on `2845a02`.
 
-## Status: M3 (full compaction, crash simulator)
+Verification status of the M4 code:
 
-M1 (WAL and memtable), M2 (SSTables, flush, manifest), and M3 are
-implemented. Bloom filters and benchmarks (M4) are not.
+- Local: before it was committed, the M4 code passed 534 tests in a
+  Debug ASan/UBSan build with test data on ext4, with no skipped or
+  disabled tests and no sanitizer report (docs/failure-matrix.md). The
+  committed code differs from that tree only in three comments.
+- Not yet done: remote CI for the M4 commits, the owner's review of M4,
+  and a release tag.
+
+## Status: M4 (Bloom filters, counters, benchmarks)
+
+M1 (WAL and memtable), M2 (SSTables, flush, manifest), M3 (full
+compaction, crash simulator), and M4 are implemented.
 
 Implemented in M1:
 
@@ -103,10 +114,33 @@ Implemented in M3 (docs/m3-design.md, docs/sst-format.md section 4):
 - Every filesystem call of the engine goes through the syscall seam,
   including directory listing, lstat, mkdir, and the lock (D-020).
 - A deterministic crash simulator behind the seam
-  (`src/testing/crash_sim.h`): 7 fixed workloads with 756 enumerated
-  crash points, each recovered under a process-crash model and an
+  (`src/testing/crash_sim.h`): 7 fixed workloads with enumerated crash
+  points (756 in M3; 793 since M4, because every SST also writes its
+  filter), each recovered under a process-crash model and an
   unsynced-state-loss model and checked by a response-aware oracle.
   These are simulated failures, not hardware power-loss evidence.
+
+Implemented in M4 (docs/m4-design.md, docs/sst-format.md section 3.7):
+
+- SST version 2: one Bloom filter per SST of every stored key,
+  tombstones included, with a hash defined by the format (KVHASH1);
+  10 bits per key and 7 probes by default. Version 1 SSTs stay readable
+  beside version 2 SSTs in one database.
+- Lookup skips an SST without I/O when the key is outside its key range
+  or its filter answers "absent"; a positive answer always reads the
+  block.
+- A damaged filter fails Open (checksum, bounds, key count, or a stored
+  key the filter would deny); a filter is never trusted unchecked. The
+  filter size is bounded before allocation, and a filter-bearing SST
+  holds at most 2^22 keys; compaction splits outputs at that limit
+  (D-027 to D-029).
+- Internal counters (lookups, data-block requests, user, WAL, SST, and
+  metadata bytes) and internal switches (filter bits per key, a
+  benchmark-only filter-query bypass), outside the public Options
+  (D-030).
+- A Release benchmark driver (`bench/`, CMake option `KV_BUILD_BENCH`,
+  off by default) and runner scripts for four experiment groups. Its
+  sync bypass exists only in the driver.
 
 Settled design decisions and their validating tests are in
 [docs/decisions.md](docs/decisions.md). Observed defects are in
@@ -130,7 +164,7 @@ request.
 
 ### Differential tests
 
-`Seeds/DifferentialTest.*` compares seven workloads against an independent
+`Seeds/DifferentialTest.*` compares eight workloads against an independent
 reference map: the memtable; the DB without reopen; the DB with a reopen
 every 500 operations; and the same two DB workloads with a 4 KiB memtable
 (`DbFlushWithoutReopen`, `DbFlushPeriodicReopen`, compaction disabled),
@@ -138,7 +172,9 @@ so flushes and SST lookups happen throughout; and two compaction
 workloads, `DbCompactionPeriodicReopen` (threshold 2; 34 to 49
 compactions per seed) and `DbMultiOutputCompactionPeriodicReopen`
 (lowered SST limits, base runs of 2 to 3 SSTs; 332 to 355 compactions
-per seed). The flush workloads read the published MANIFEST
+per seed); and `DbMixedFilterPeriodicReopen` (M4), which alternates
+filters between opens so filterless and filter-bearing SSTs are live
+together. The flush workloads read the published MANIFEST
 with an independent parser and require at least `KV_DIFF_OPS / 500` flushes
 per seed. Each seed records its flush count as a test property. Seeds
 1-20 at 5000 operations produced 35 to 50 flushes each. It runs 20 seeds x
@@ -240,6 +276,55 @@ open:
   workloads.
 - Cross-process lock testing: not implemented.
 
+## Performance (M4)
+
+Local measurements, warm page cache, from
+[bench/results/summary.md](bench/results/summary.md) (median [min, max]
+of 3 runs; raw data in `bench/results/raw/`; environment in
+`bench/results/environment.txt`; caveats in
+[bench/results/NOTES.md](bench/results/NOTES.md)). They were measured on
+the pre-integration M4 snapshot named in environment.txt, whose engine
+and benchmark driver differ from these commits only in source comments;
+they were not re-measured here. Environment: AMD Ryzen 9 7945HX (32
+logical CPUs), 7.9 GB RAM visible to WSL2, ext4 on a WSL2 virtual disk,
+GCC 15.2 `-O3`, sanitizers off. Keys 16 bytes, values 100 bytes, seed 42.
+Request counts are engine requests, not device reads. Latencies are per
+call and include about 20 ns of clock overhead. ops/s is calls divided
+by the summed per-call times; summary.md also reports wall ops/s, which
+counts the harness work between calls. Earlier results that used a
+different throughput definition are kept, superseded, in
+`bench/results/historical-2026-11-02T1825/`.
+
+| Experiment | Configuration | Result |
+|---|---|---|
+| 1. Synchronous inserts | 20,000 random Puts, 64 KiB memtable, threshold 4 | 217 [159, 219] ops/s; p50 4.48 ms, p99 5.97 ms, max 105 ms (maintenance included) |
+| 1. Reads | 200,000 keys, 50,000 lookups each, filters on | existing p50 12.1 us, p99 20.8 us; missing p50 0.14 us, p99 0.38 us |
+| 2. Sync bypass (unsafe reference) | same insert trace, every fsync skipped | 78,229 ops/s (about 360x); the gap is a sync-policy effect, not an exact fsync time share |
+| 3. Bloom on vs bypassed | same files, same missing-key trace (inside the key range) | data-block requests per lookup 0.008 vs 1.000 (-99.2%); bytes requested 31 vs 3,998; p50 0.14 vs 12.04 us |
+| 4. Run threshold 2 / 4 / 8 / off | same trace (20,000 ops over 10,000 keys, 10% deletes), same end | write amplification 16.06 / 6.95 / 4.20 / 2.42; DB bytes 1.06 / 1.11 / 1.32 / 2.45 MB; SST candidates per lookup 1.0 / 1.9 / 5.3 / 18.2; max insert latency 102 / 99 / 102 / 59 ms (see the caveat below) |
+
+Trade-offs seen: Bloom filters remove nearly all data-block requests for
+missing keys at about 1.25 bytes per key; in this setup the read database
+had compacted to one SST, so each lookup saved one block. Lower thresholds
+cut lookup candidates and database size but rewrite all live data more
+often (higher write amplification). Caveat for group 4 latencies:
+synchronous latency changed with time during the run (insert p50 about
+4.5 ms in the first two threshold runs, 6.6-7.0 ms in all later ones, in
+every configuration; cause not measured). Group 4 throughput and
+latencies, including the lower maximum without compaction (59 vs about
+100 ms), therefore cannot establish the causal effect of the threshold
+on latency; see bench/results/NOTES.md and the note in
+threshold_p99.svg.
+
+Reproduce:
+
+```sh
+cmake -S . -B build-bench -G Ninja -DCMAKE_BUILD_TYPE=Release -DKV_SANITIZE=OFF -DBUILD_TESTING=OFF -DKV_BUILD_BENCH=ON
+cmake --build build-bench
+scripts/run_benchmarks.sh build-bench/bench/kv_bench <data dir> <results dir>
+scripts/summarize_bench.py <results dir>
+```
+
 ## Limitations
 
 - Recovery reads the whole active WAL into memory, so peak memory is about
@@ -267,6 +352,11 @@ open:
   directory.
 - M1 and M2 databases cannot be opened; there is no migration (D-009,
   D-025).
+- Each open SST keeps its filter in memory (about 1.25 bytes per key at
+  the default). A filter-bearing SST holds at most 2^22 keys, so a single
+  flush of more keys fails without losing acknowledged data (D-029).
+- The benchmarks cover one parameter set with a warm page cache on a WSL2
+  virtual disk; they do not measure device I/O or cold reads.
 - One process and one calling thread. The lock is advisory. It does not
   stop other processes from editing the directory.
 - Symbolic links are not followed: a symlinked database directory, `LOCK`,
@@ -279,13 +369,15 @@ open:
 ## Layout
 
 ```
-src/core/      engine: codecs (WAL, SST, manifest), memtable, compaction
-               merge, file names, POSIX file/directory/lock, DB
+src/core/      engine: codecs (WAL, SST, manifest, Bloom), memtable,
+               compaction merge, file names, POSIX file/directory/lock, DB
 src/testing/   header-only test helpers (temp dirs, independent WAL, SST,
                and manifest builders, fault-injecting syscalls, crash
                simulator)
 tests/harness/ GoogleTest suites
-scripts/       longer differential runs
-docs/          design contract, format spec, M3 design, decisions, bug
-               log, failure matrix
+bench/         benchmark driver and recorded results
+scripts/       longer differential runs, benchmark runner and summary,
+               Bloom reference vectors
+docs/          design contract, format spec, M3 and M4 designs,
+               decisions, bug log, failure matrix
 ```
