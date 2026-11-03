@@ -42,14 +42,16 @@ Status CheckSyscallPath(const std::filesystem::path& path,
     return Status::Ok();
 }
 
-Status InspectPath(const std::filesystem::path& path, PathKind& out_kind) {
+Status InspectPath(const std::filesystem::path& path,
+                   PathKind& out_kind,
+                   PosixSyscalls& syscalls) {
     Status s = CheckSyscallPath(path, "inspect");
     if (!s.ok()) {
         return s;
     }
 
     struct stat st;
-    if (::lstat(path.c_str(), &st) != 0) {
+    if (syscalls.Lstat(path.c_str(), &st) != 0) {
         const int err = errno;
         if (err == ENOENT) {
             out_kind = PathKind::kMissing;
@@ -68,19 +70,14 @@ Status InspectPath(const std::filesystem::path& path, PathKind& out_kind) {
     return Status::Ok();
 }
 
-Status ListDirectory(const std::filesystem::path& dir,
-                     std::vector<std::string>& out_names) {
-    Status s = CheckSyscallPath(dir, "list directory");
-    if (!s.ok()) {
-        return s;
-    }
-
-    DIR* stream = ::opendir(dir.c_str());
+int PosixSyscalls::ListDirectory(const char* path,
+                                 std::vector<std::string>& names) {
+    DIR* stream = ::opendir(path);
     if (stream == nullptr) {
-        return PathError(dir, "list directory", errno);
+        return -1;
     }
 
-    std::vector<std::string> names;
+    std::vector<std::string> listed;
     int read_err = 0;
     for (;;) {
         // readdir signals both end-of-stream and error with nullptr; only
@@ -95,30 +92,48 @@ Status ListDirectory(const std::filesystem::path& dir,
             std::strcmp(entry->d_name, "..") == 0) {
             continue;
         }
-        names.emplace_back(entry->d_name);
+        listed.emplace_back(entry->d_name);
     }
 
     const int close_rc = ::closedir(stream);
     const int close_err = errno;
-
     if (read_err != 0) {
-        return PathError(dir, "read directory", read_err);
+        errno = read_err;
+        return -1;
     }
     if (close_rc != 0) {
-        return PathError(dir, "close directory", close_err);
+        errno = close_err;
+        return -1;
+    }
+    names = std::move(listed);
+    return 0;
+}
+
+Status ListDirectory(const std::filesystem::path& dir,
+                     std::vector<std::string>& out_names,
+                     PosixSyscalls& syscalls) {
+    Status s = CheckSyscallPath(dir, "list directory");
+    if (!s.ok()) {
+        return s;
     }
 
+    std::vector<std::string> names;
+    if (syscalls.ListDirectory(dir.c_str(), names) != 0) {
+        return PathError(dir, "list directory", errno);
+    }
     out_names = std::move(names);
     return Status::Ok();
 }
 
-Status CreateDirectory(const std::filesystem::path& dir, bool& out_created) {
+Status CreateDirectory(const std::filesystem::path& dir,
+                       bool& out_created,
+                       PosixSyscalls& syscalls) {
     Status s = CheckSyscallPath(dir, "create directory");
     if (!s.ok()) {
         return s;
     }
 
-    if (::mkdir(dir.c_str(), 0755) == 0) {
+    if (syscalls.Mkdir(dir.c_str(), 0755) == 0) {
         out_created = true;
         return Status::Ok();
     }
@@ -130,7 +145,7 @@ Status CreateDirectory(const std::filesystem::path& dir, bool& out_created) {
 
     // EEXIST covers any kind of entry, including a dangling symlink.
     PathKind kind;
-    s = InspectPath(dir, kind);
+    s = InspectPath(dir, kind, syscalls);
     if (!s.ok()) {
         return s;
     }

@@ -69,9 +69,11 @@ struct DirectoryState {
     std::vector<std::string> unrelated;
 };
 
-Status ScanDirectory(const fs::path& dir, DirectoryState& state) {
+Status ScanDirectory(const fs::path& dir,
+                     DirectoryState& state,
+                     PosixSyscalls& syscalls) {
     std::vector<std::string> names;
-    Status s = ListDirectory(dir, names);
+    Status s = ListDirectory(dir, names, syscalls);
     if (!s.ok()) {
         return s;
     }
@@ -96,7 +98,7 @@ Status ScanDirectory(const fs::path& dir, DirectoryState& state) {
         }
 
         PathKind kind;
-        s = InspectPath(dir / name, kind);
+        s = InspectPath(dir / name, kind, syscalls);
         if (!s.ok()) {
             return s;
         }
@@ -187,9 +189,9 @@ Status PublishFile(const fs::path& temp,
 }
 
 // Checks that a file named by the manifest exists as a regular file.
-Status CheckReferencedFile(const fs::path& path) {
+Status CheckReferencedFile(const fs::path& path, PosixSyscalls& syscalls) {
     PathKind kind;
-    Status s = InspectPath(path, kind);
+    Status s = InspectPath(path, kind, syscalls);
     if (!s.ok()) {
         return s;
     }
@@ -349,7 +351,7 @@ Status DB::Impl::Initialize() {
 Status DB::Impl::Recover(const DirectoryState& state) {
     const fs::path manifest_path = dir / kManifestFileName;
     PathKind kind;
-    Status s = InspectPath(manifest_path, kind);
+    Status s = InspectPath(manifest_path, kind, *syscalls);
     if (!s.ok()) {
         return s;
     }
@@ -365,12 +367,12 @@ Status DB::Impl::Recover(const DirectoryState& state) {
 
     // Every reference must exist before any content is trusted.
     const fs::path wal_path = dir / WalFileName(m.active_wal_id);
-    s = CheckReferencedFile(wal_path);
+    s = CheckReferencedFile(wal_path, *syscalls);
     if (!s.ok()) {
         return s;
     }
     for (const ManifestSst& sst : m.ssts) {
-        s = CheckReferencedFile(dir / SstFileName(sst.file_id));
+        s = CheckReferencedFile(dir / SstFileName(sst.file_id), *syscalls);
         if (!s.ok()) {
             return s;
         }
@@ -503,12 +505,12 @@ Status DB::Impl::Write(ValueType type,
             return Status::IOError(s.message);
         }
         memtable.Apply(sequence, type, key, value);
+        last_sequence = sequence;
+        syscalls->Checkpoint("write.applied");
     } catch (...) {
         needs_recovery = true;
         throw;
     }
-
-    last_sequence = sequence;
     return Status::Ok();
 }
 
@@ -713,7 +715,7 @@ Status DBOpener::Open(const std::filesystem::path& directory,
     const fs::path dir = StripTrailingSeparators(directory);
 
     PathKind kind;
-    s = InspectPath(dir, kind);
+    s = InspectPath(dir, kind, syscalls);
     if (!s.ok()) {
         return s;
     }
@@ -723,7 +725,7 @@ Status DBOpener::Open(const std::filesystem::path& directory,
         }
         // One level only; a missing parent is an error.
         bool created = false;
-        s = CreateDirectory(dir, created);
+        s = CreateDirectory(dir, created, syscalls);
         if (!s.ok()) {
             return s;
         }
@@ -742,7 +744,7 @@ Status DBOpener::Open(const std::filesystem::path& directory,
     // First pass, before the lock: decides every rejecting state without
     // creating LOCK in a directory this call must not touch.
     DirectoryState state;
-    s = ScanDirectory(dir, state);
+    s = ScanDirectory(dir, state, syscalls);
     if (!s.ok()) {
         return s;
     }
@@ -755,14 +757,14 @@ Status DBOpener::Open(const std::filesystem::path& directory,
     impl->dir = dir;
     impl->syscalls = &syscalls;
     impl->memtable_bytes = options.memtable_bytes;
-    s = LockFile(dir / kLockFileName, impl->lock);
+    s = LockFile(dir / kLockFileName, impl->lock, syscalls);
     if (!s.ok()) {
         return s;
     }
 
     // Second pass under the lock: another process may have changed the
     // directory between the first scan and lock acquisition.
-    s = ScanDirectory(dir, state);
+    s = ScanDirectory(dir, state, syscalls);
     if (!s.ok()) {
         return s;
     }

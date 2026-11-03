@@ -9,9 +9,9 @@
 
 namespace kv {
 
-// Directory-entry primitives over POSIX calls. None of these operations
-// syncs a directory; callers decide which directories need SyncDirectory
-// to make namespace changes durable.
+// Directory-entry primitives over the PosixSyscalls seam (the real calls
+// by default). None of these operations syncs a directory; callers decide
+// which directories need SyncDirectory to make namespace changes durable.
 
 // Returns InvalidArgument for an empty path or one containing a NUL byte,
 // which C APIs would silently truncate. Every function below checks this
@@ -30,14 +30,17 @@ enum class PathKind {
 // dangling symlink is kOther, not kMissing. Only ENOENT maps to kMissing;
 // other failures (EACCES, ENOTDIR, EIO, ...) return IOError and leave
 // out_kind unchanged.
-Status InspectPath(const std::filesystem::path& path, PathKind& out_kind);
+Status InspectPath(const std::filesystem::path& path,
+                   PathKind& out_kind,
+                   PosixSyscalls& syscalls = DefaultPosixSyscalls());
 
 // Replaces out_names with the immediate entry names of dir, excluding "."
 // and "..", in unspecified order. Hidden and unrelated entries are
 // included. On failure out_names is unchanged; a partial listing is never
 // returned as success.
 Status ListDirectory(const std::filesystem::path& dir,
-                     std::vector<std::string>& out_names);
+                     std::vector<std::string>& out_names,
+                     PosixSyscalls& syscalls = DefaultPosixSyscalls());
 
 // Creates dir (one level; parents are not created). Sets out_created to
 // true if this call created it, or false if a directory already existed
@@ -45,7 +48,9 @@ Status ListDirectory(const std::filesystem::path& dir,
 // An existing nondirectory or a missing parent returns IOError. On
 // failure out_created is unchanged. Creation is not durable until the
 // parent directory is synced.
-Status CreateDirectory(const std::filesystem::path& dir, bool& out_created);
+Status CreateDirectory(const std::filesystem::path& dir,
+                       bool& out_created,
+                       PosixSyscalls& syscalls = DefaultPosixSyscalls());
 
 // rename(2): if to exists it is atomically replaced, so observers see
 // either the old or the new file at to, never neither. If from is a

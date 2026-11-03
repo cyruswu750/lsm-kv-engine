@@ -5,6 +5,7 @@
 #include <string>
 #include <utility>
 
+#include "posix_file.h"
 #include "status.h"
 
 namespace kv {
@@ -26,11 +27,14 @@ public:
 
 private:
     friend Status LockFile(const std::filesystem::path& path,
-                           std::unique_ptr<FileLock>& out);
+                           std::unique_ptr<FileLock>& out,
+                           PosixSyscalls& syscalls);
 
-    explicit FileLock(std::string path) : path_(std::move(path)) {}
+    FileLock(std::string path, PosixSyscalls& syscalls)
+        : path_(std::move(path)), syscalls_(&syscalls) {}
 
     std::string path_;
+    PosixSyscalls* syscalls_;
     int fd_ = -1;
 };
 
@@ -42,7 +46,11 @@ private:
 //
 // flock locks belong to the open file description: a child created by
 // fork shares it, but O_CLOEXEC keeps it out of exec'd programs.
+//
+// The open, flock, unlock, and close go through syscalls, which must
+// outlive out.
 Status LockFile(const std::filesystem::path& path,
-                std::unique_ptr<FileLock>& out);
+                std::unique_ptr<FileLock>& out,
+                PosixSyscalls& syscalls = DefaultPosixSyscalls());
 
 }  // namespace kv

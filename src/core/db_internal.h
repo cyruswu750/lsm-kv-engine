@@ -15,16 +15,16 @@ namespace kv {
 // through Options; DB::Open calls it with DefaultPosixSyscalls().
 class DBOpener {
 public:
-    // Same contract as DB::Open. Every open, read, pread, write, fstat,
-    // ftruncate, fsync, close, rename, and unlink on WAL, SST, and manifest
-    // files (and their temporary files), and every directory fsync, goes
-    // through syscalls. Listing, lstat inspection, mkdir, and the LOCK
-    // file's open and flock always use the real system calls
-    // (docs/sst-format.md section 12).
+    // Same contract as DB::Open. Every filesystem operation of the
+    // database goes through syscalls: file open, read, pread, write,
+    // fstat, ftruncate, fsync, close, rename, and unlink; lstat
+    // inspection, directory listing, mkdir, directory fsync; and the LOCK
+    // file's open, flock, and close. The engine also reports named
+    // non-syscall boundaries through syscalls.Checkpoint.
     //
     // syscalls is not owned. It must outlive the returned DB, because the
-    // DB keeps using it for WAL appends, flushes, and SST reads until it
-    // is destroyed.
+    // DB keeps using it for WAL appends, flushes, SST reads, and releasing
+    // the lock until it is destroyed.
     static Status Open(const std::filesystem::path& directory,
                        const Options& options,
                        PosixSyscalls& syscalls,
