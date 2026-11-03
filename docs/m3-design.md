@@ -7,8 +7,8 @@ section 5 (a multi-SST base run, run-count triggering, manifest version 2
 only). SST v1, WAL v1, and the file names are unchanged.
 The manifest is version 2 only (sst-format.md section 4): M2 databases
 (manifest version 1) are deliberately unsupported, with no migration.
-M3 decisions are recorded in section 11 for now; they move to
-docs/decisions.md when the pending M2 documentation is integrated.
+Section 11 lists the M3 decisions; docs/decisions.md records them as
+D-017 to D-026.
 
 ## 1. Scope
 
