@@ -6,9 +6,10 @@ An embedded persistent byte-key/byte-value store in C++20, built to study
 recovery of acknowledged writes, safe publication of on-disk state, and the
 costs of durability. It does not use LevelDB or RocksDB as its storage
 implementation, and its formats are intentionally not LevelDB compatible.
-The design contract is [docs/design.md](docs/design.md). The exact M2
+The design contract is [docs/design.md](docs/design.md). The exact
 SSTable, manifest, naming, and directory-state rules are in
-[docs/sst-format.md](docs/sst-format.md).
+[docs/sst-format.md](docs/sst-format.md); compaction and the crash
+simulator are specified in [docs/m3-design.md](docs/m3-design.md).
 
 The badge shows the result of the latest remote CI run. Local test results
 are not a substitute for it.
@@ -22,10 +23,19 @@ Verification status of the M2 code (commit c6a410f):
 - Release tag: `v0.2-m2` (annotated) is on `6d702e4`; the commits
   after `c6a410f` change documentation only.
 
-## Status: M2 (SSTables, synchronous flush, manifest)
+Verification status of the M3 code:
 
-M1 (WAL and memtable) and M2 are implemented. Compaction (M3) and Bloom
-filters and benchmarks (M4) are not.
+- Local: before it was committed, the M3 code passed 493 tests in a
+  Debug ASan/UBSan build with test data on ext4, with no skipped or
+  disabled tests and no sanitizer report (docs/failure-matrix.md).
+  The committed code differs from that tree only in two comments.
+- Not yet done: remote CI for the M3 commits, the owner's review of
+  M3, and a release tag.
+
+## Status: M3 (full compaction, crash simulator)
+
+M1 (WAL and memtable), M2 (SSTables, flush, manifest), and M3 are
+implemented. Bloom filters and benchmarks (M4) are not.
 
 Implemented in M1:
 
@@ -72,6 +82,30 @@ Implemented in M2 (docs/sst-format.md):
   until a published manifest covers them. Sequence, file-ID, and
   generation exhaustion reject mutations before any I/O.
 
+Implemented in M3 (docs/m3-design.md, docs/sst-format.md section 4):
+
+- Full compaction before the next mutation once the logical run count
+  reaches an internal threshold (default 4; the base run counts once,
+  each flush run once). Every live SST is merged into one base run of
+  key-partitioned SSTs, each within the per-SST block and index
+  limits, published by one manifest. Winning tombstones are dropped
+  because every older version is an input; the active WAL and the
+  checkpoint are kept.
+- Manifest version 2 with a base run count. M2 databases (manifest
+  version 1) are rejected with `UnsupportedFormat` and left unchanged;
+  there is no migration. An M2 executable rejects M3 databases the
+  same way.
+- Lookup: memtable, then flush-run SSTs from newest to oldest, then
+  the one base SST whose key range can hold the key; the first value
+  or tombstone wins.
+- Every filesystem call of the engine goes through the syscall seam,
+  including directory listing, lstat, mkdir, and the lock (D-020).
+- A deterministic crash simulator behind the seam
+  (`src/testing/crash_sim.h`): 7 fixed workloads with 756 enumerated
+  crash points, each recovered under a process-crash model and an
+  unsynced-state-loss model and checked by a response-aware oracle.
+  These are simulated failures, not hardware power-loss evidence.
+
 Settled design decisions and their validating tests are in
 [docs/decisions.md](docs/decisions.md). Observed defects are in
 [docs/BUGLOG.md](docs/BUGLOG.md).
@@ -94,11 +128,15 @@ request.
 
 ### Differential tests
 
-`Seeds/DifferentialTest.*` compares five workloads against an independent
+`Seeds/DifferentialTest.*` compares seven workloads against an independent
 reference map: the memtable; the DB without reopen; the DB with a reopen
 every 500 operations; and the same two DB workloads with a 4 KiB memtable
-(`DbFlushWithoutReopen`, `DbFlushPeriodicReopen`), so flushes and SST
-lookups happen throughout. The flush workloads read the published MANIFEST
+(`DbFlushWithoutReopen`, `DbFlushPeriodicReopen`, compaction disabled),
+so flushes and SST lookups happen throughout; and two compaction
+workloads, `DbCompactionPeriodicReopen` (threshold 2; 34 to 49
+compactions per seed) and `DbMultiOutputCompactionPeriodicReopen`
+(lowered SST limits, base runs of 2 to 3 SSTs; 332 to 355 compactions
+per seed). The flush workloads read the published MANIFEST
 with an independent parser and require at least `KV_DIFF_OPS / 500` flushes
 per seed. Each seed records its flush count as a test property. Seeds
 1-20 at 5000 operations produced 35 to 50 flushes each. It runs 20 seeds x
@@ -130,8 +168,13 @@ temporary directory, so where that lives decides which case a run measures.
   D-014). They exercise the engine's control flow and recovered state.
   Each M2 publication fault test asserts that the injected fault was
   actually reached.
-- No test simulates power loss or discards the page cache. Results show
-  behavior under the filesystem's fsync contract, not hardware durability.
+- The crash simulator (M3) terminates the engine at the enumerated
+  points of fixed workloads and recovers under two models: a process
+  crash, and the loss of every unsynced file content and directory
+  entry. It does not model torn sector writes, writeback reordering
+  inside a file, or device failures. No test discards a real page
+  cache or cuts power. Results show behavior under the filesystem's
+  fsync contract, not hardware durability.
   WSL2 results also depend on host storage.
 
 ### M1 failure matrix
@@ -179,18 +222,20 @@ where the WAL is `wal-<id>.log` and is named by MANIFEST.
 | Missing, damaged, or mismatched referenced SST or WAL | File removal and mutation | `Corruption` (`UnsupportedFormat` for SST version 2); nothing changed | `DBM2ReferenceTest.*` | Passes locally |
 | Deleted key reappearing | Flushes and reopen | Never: a flushed tombstone or a WAL-only tombstone hides an older SST value | `DBM2Test.FlushedDeleteShadowsOlderFlushedValue`, `DBM2Test.WalOnlyDeleteShadowsFlushedValue` | Passes locally |
 | Random traces with frequent flushes | Differential, 4 KiB memtable, seeds 1-20 x 5000 ops, reopen every 500 | Matches the reference map; at least 10 flushes per seed | `Seeds/DifferentialTest.DbFlush*` | Passes locally |
-| Process termination or power loss during publication | None | Planned for the M3 crash simulator | None | Not tested |
+| Process termination or simulated power loss during publication | Crash simulator (M3) | Every enumerated crash point recovers under both models (docs/failure-matrix.md section 2) | `Workloads/CrashMatrixTest.*` | Passes locally |
 
 Coverage status: every testable item on the Week 1 and Week 2 checklists
 has a passing local test; remote CI, review, and release status are listed
 at the top. These items on the broader design.md section 10 roadmap remain
 open:
 
-- Failure-matrix documentation: the matrices above are compact. Seed and
-  observed-result columns, and M3 checkpoints (compaction publication),
-  are still to be added.
-- Process termination and simulated power loss at enumerated checkpoints
-  (the M3 crash simulator): not implemented.
+- Failure-matrix documentation: docs/failure-matrix.md (M1-M3) lists
+  the mechanism, expected and observed result, and regression test of
+  each row, including compaction publication; the matrices above stay
+  compact.
+- Process termination and simulated power loss at enumerated
+  checkpoints: implemented by the M3 crash simulator for its fixed
+  workloads.
 - Cross-process lock testing: not implemented.
 
 ## Limitations
@@ -199,9 +244,13 @@ open:
   twice its size (D-007). A flush retires the WAL when the memtable
   reaches its threshold, but overwrites that do not grow the memtable
   still grow the WAL.
-- No compaction yet (M3): every flush adds an SST, and Get may probe
-  every SST from newest to oldest. Each probe opens and closes the file
+- Compaction is full, not leveled, and runs in the foreground inside
+  the `Put` or `Delete` that reaches the threshold; every compaction
+  rewrites all live data. Between compactions Get may probe every
+  flush-run SST and one base SST. Each probe opens and closes the file
   (D-011).
+- Live data must fit in about 2^20 SSTs; a larger compaction fails
+  with `InvalidArgument` and `NeedsRecovery` before publication (D-024).
 - Open reads every live SST in full to validate it (D-010). Startup I/O
   grows with the data size.
 - Flushes run in the foreground, inside the `Put` or `Delete` that finds
@@ -214,7 +263,8 @@ open:
 - A crash during the very first initialization can leave residue that
   Open reports as `Corruption`. It needs manual cleanup or a fresh
   directory.
-- M1 databases cannot be opened (D-009).
+- M1 and M2 databases cannot be opened; there is no migration (D-009,
+  D-025).
 - One process and one calling thread. The lock is advisory. It does not
   stop other processes from editing the directory.
 - Symbolic links are not followed: a symlinked database directory, `LOCK`,
@@ -227,11 +277,13 @@ open:
 ## Layout
 
 ```
-src/core/      engine: codecs (WAL, SST, manifest), memtable, file names,
-               POSIX file/directory/lock, DB
+src/core/      engine: codecs (WAL, SST, manifest), memtable, compaction
+               merge, file names, POSIX file/directory/lock, DB
 src/testing/   header-only test helpers (temp dirs, independent WAL, SST,
-               and manifest builders, fault-injecting syscalls)
+               and manifest builders, fault-injecting syscalls, crash
+               simulator)
 tests/harness/ GoogleTest suites
 scripts/       longer differential runs
-docs/          design contract, M2 format spec, decisions, bug log
+docs/          design contract, format spec, M3 design, decisions, bug
+               log, failure matrix
 ```
