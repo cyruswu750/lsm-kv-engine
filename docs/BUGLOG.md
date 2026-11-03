@@ -138,3 +138,32 @@ affecting correctness, recovery, or data integrity.
 - Commits: the limits, the fix, and the regression tests were committed
   together with the SST module in 855168d, and the format text in
   0d48e5c. There is no separate pre-fix commit.
+
+## B-007: The compaction merge missed duplicate sequences behind a newer version
+
+- Symptom: `MergingIterator::Settle` compared each version of a key only
+  with the current winner. For one key with sequences 10, 5, and 5 (two
+  different values at sequence 5), input orders [10, 5, 5] and
+  [5, 10, 5] returned the sequence-10 version without reporting the
+  conflict; only [5, 5, 10] was detected.
+- Found by: Review of the uncommitted M3 merge, before the M3 code was
+  committed.
+- Impact: A missed Corruption report in the merge component. The selected
+  winner was still the correct sequence-10 version, and no data loss was
+  observed. Through normal database operation the input is very hard to
+  reach: the manifest requires disjoint, ordered sequence intervals for
+  flush runs, Open checks every SST's actual sequence range, and keys are
+  unique within an SST.
+- Cause: The check compared each version only with the current
+  winner. Once the newer version became the winner, the two equal
+  older sequences were never compared with each other.
+- Fix: Every pair of versions of the current key is compared before the
+  winner is chosen (src/core/compaction.cc), independent of input order.
+- Verification: `CompactionInputTest.MergeRejectsDuplicateSequencesBehindANewerVersion`
+  (all six input orders, and the conflict found by Next after the first
+  key) failed before the fix: 4 of 6 orders returned Ok instead of
+  Corruption, and the Next path also returned Ok. It passes after the
+  fix.
+- Commits: the fix and the regression test were committed together
+  with the compaction merge in 53e53ed. There is no separate pre-fix
+  commit.

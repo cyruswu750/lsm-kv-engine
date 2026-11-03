@@ -85,18 +85,29 @@ protected:
     // memtable_bytes = 1 flushes before every mutation that finds a
     // nonempty memtable, so file IDs are predictable: the n-th flush
     // writes sst-(2n) and wal-(2n+1).
+    // compaction_trigger defaults to the engine default. Tests whose
+    // subject is lookup across several live SSTs (an M2 property that
+    // still holds below the trigger) pass 0 to disable compaction.
     Status OpenDb(std::unique_ptr<DB>& db,
                   std::size_t memtable_bytes = 1,
-                  bool create = true) {
+                  bool create = true,
+                  std::size_t compaction_trigger =
+                      InternalOptions{}.compaction_trigger) {
         Options options;
         options.memtable_bytes = memtable_bytes;
         options.create_if_missing = create;
-        return DB::Open(Db(), options, db);
+        InternalOptions internal;
+        internal.compaction_trigger = compaction_trigger;
+        return DBOpener::Open(Db(), options, internal, DefaultPosixSyscalls(),
+                              db);
     }
 
-    std::unique_ptr<DB> MustOpen(std::size_t memtable_bytes = 1) {
+    std::unique_ptr<DB> MustOpen(std::size_t memtable_bytes = 1,
+                                 std::size_t compaction_trigger =
+                                     InternalOptions{}.compaction_trigger) {
         std::unique_ptr<DB> db;
-        const Status s = OpenDb(db, memtable_bytes);
+        const Status s =
+            OpenDb(db, memtable_bytes, /*create=*/true, compaction_trigger);
         EXPECT_TRUE(s.ok()) << s.ToString();
         return db;
     }
@@ -246,8 +257,10 @@ TEST_F(DBM2Test, InvalidMutationDoesNotTriggerFlush) {
     EXPECT_TRUE(fs::exists(Db() / "sst-000002.sst"));
 }
 
+// Compaction is disabled so that four SSTs stay live (docs/m3-design.md
+// section 10); compacted lookups are covered in db_m3_test.cpp.
 TEST_F(DBM2Test, LookupStopsAtNewestValueOrTombstoneAcrossSsts) {
-    auto db = MustOpen();
+    auto db = MustOpen(1, /*compaction_trigger=*/0);
     ASSERT_TRUE(db->Put("k", "v1").ok());
     ASSERT_TRUE(db->Put("k", "v2").ok());   // v1 -> sst 2
     ASSERT_TRUE(db->Put("other", "o").ok());  // v2 -> sst 4
@@ -259,7 +272,7 @@ TEST_F(DBM2Test, LookupStopsAtNewestValueOrTombstoneAcrossSsts) {
     ASSERT_TRUE(db->Put("k", "v3").ok());  // newest in the WAL/memtable
     EXPECT_EQ(Lookup(*db, "k"), "v3");
     db.reset();
-    db = MustOpen();
+    db = MustOpen(1, /*compaction_trigger=*/0);
     EXPECT_EQ(Lookup(*db, "k"), "v3");
     EXPECT_EQ(Lookup(*db, "tail"), "t");
 }
@@ -298,12 +311,13 @@ TEST_F(DBM2Test, WalOnlyDeleteShadowsFlushedValue) {
     EXPECT_EQ(Lookup(*db, "k"), std::nullopt);
 }
 
+// Compaction is disabled so the maximum entry keeps its own SST.
 TEST_F(DBM2Test, LargeEntriesAtApiLimitsSurviveFlushAndReopen) {
     const std::string max_key(kMaxKeyLength, 'k');
     const std::string max_value(kMaxValueLength, '\x80');
     const std::string mid_value(5000, 'm');
     {
-        auto db = MustOpen();
+        auto db = MustOpen(1, /*compaction_trigger=*/0);
         ASSERT_TRUE(db->Put(max_key, max_value).ok());
         ASSERT_TRUE(db->Put("mid", mid_value).ok());
         ASSERT_TRUE(db->Delete(max_key + "").ok());
@@ -311,7 +325,7 @@ TEST_F(DBM2Test, LargeEntriesAtApiLimitsSurviveFlushAndReopen) {
         ASSERT_TRUE(db->Put("last", "").ok());
         EXPECT_EQ(Manifest().ssts.size(), 4u);
     }
-    auto db = MustOpen();
+    auto db = MustOpen(1, /*compaction_trigger=*/0);
     EXPECT_EQ(Lookup(*db, max_key), "small");
     EXPECT_EQ(Lookup(*db, "mid"), mid_value);
     EXPECT_EQ(Lookup(*db, "last"), "");
@@ -528,8 +542,12 @@ TEST_F(DBM2Test, InterruptedInitializationResidueIsPreservedCorruption) {
 }
 
 TEST_F(DBM2Test, MalformedManifestIsNeverTreatedAsANewDatabase) {
-    RawManifest v2;
-    v2.version = 2;
+    // Manifest version 2 is current (M3). Version 1 (the M2 format) and
+    // unknown versions are UnsupportedFormat (docs/sst-format.md 4.3).
+    RawManifest v1;
+    v1.version = 1;
+    RawManifest v3;
+    v3.version = 3;
     std::string bad_crc = ManifestBytes(RawManifest{});
     bad_crc.back() ^= 1;
     const struct {
@@ -543,7 +561,8 @@ TEST_F(DBM2Test, MalformedManifestIsNeverTreatedAsANewDatabase) {
         {"truncated", ManifestBytes(RawManifest{}).substr(0, 59),
          Code::Corruption},
         {"bad crc", bad_crc, Code::Corruption},
-        {"version 2", ManifestBytes(v2), Code::UnsupportedFormat},
+        {"version 1", ManifestBytes(v1), Code::UnsupportedFormat},
+        {"version 3", ManifestBytes(v3), Code::UnsupportedFormat},
     };
     for (const auto& c : cases) {
         SCOPED_TRACE(c.name);

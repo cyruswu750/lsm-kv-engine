@@ -12,10 +12,11 @@
 
 namespace kv::test {
 
-// Builds and parses manifest version 1 bytes (docs/sst-format.md section
-// 4) without the production codec, CRC, or little-endian helpers, so
-// tests can craft valid and malformed manifests independently and read a
-// published manifest as evidence.
+// Builds and parses manifest bytes (docs/sst-format.md section 4; version
+// 2 by default) without the production codec, CRC, or little-endian
+// helpers, so tests can craft valid and malformed manifests independently
+// and read a published manifest as evidence. Setting version = 1 builds the
+// M2 layout, where offset 52 was reserved and zero.
 
 struct RawManifestSst {
     std::uint64_t file_id = 0;
@@ -26,13 +27,13 @@ struct RawManifestSst {
 
 struct RawManifest {
     std::string magic = "KVMAN001";
-    std::uint32_t version = 1;
+    std::uint32_t version = 2;
     std::uint32_t reserved1 = 0;
     std::uint64_t generation = 1;
     std::uint64_t next_file_id = 2;
     std::uint64_t checkpoint = 0;
     std::uint64_t active_wal_id = 1;
-    std::uint32_t reserved2 = 0;
+    std::uint32_t base_run_count = 0;  // offset 52
     std::vector<RawManifestSst> ssts;
     // When set, written instead of ssts.size().
     bool override_count = false;
@@ -49,7 +50,7 @@ inline std::string ManifestBody(const RawManifest& m) {
     AppendLE(out, m.checkpoint, 8);
     AppendLE(out, m.active_wal_id, 8);
     AppendLE(out, m.override_count ? m.sst_count : m.ssts.size(), 4);
-    AppendLE(out, m.reserved2, 4);
+    AppendLE(out, m.base_run_count, 4);
     for (const RawManifestSst& sst : m.ssts) {
         AppendLE(out, sst.file_id, 8);
         AppendLE(out, sst.file_size, 8);
@@ -77,11 +78,11 @@ inline std::uint64_t ReadLE(std::string_view bytes,
     return value;
 }
 
-// Parses a well-formed manifest (checks magic, version, size, and CRC
-// only). Returns false for anything else.
+// Parses a well-formed version 2 manifest (checks magic, version, size, and
+// CRC only). Returns false for anything else.
 inline bool ParseManifestBytes(std::string_view bytes, RawManifest& out) {
     if (bytes.size() < 60 || bytes.substr(0, 8) != "KVMAN001" ||
-        ReadLE(bytes, 8, 4) != 1) {
+        ReadLE(bytes, 8, 4) != 2) {
         return false;
     }
     const std::uint64_t count = ReadLE(bytes, 48, 4);
@@ -96,7 +97,7 @@ inline bool ParseManifestBytes(std::string_view bytes, RawManifest& out) {
     m.next_file_id = ReadLE(bytes, 24, 8);
     m.checkpoint = ReadLE(bytes, 32, 8);
     m.active_wal_id = ReadLE(bytes, 40, 8);
-    m.reserved2 = static_cast<std::uint32_t>(ReadLE(bytes, 52, 4));
+    m.base_run_count = static_cast<std::uint32_t>(ReadLE(bytes, 52, 4));
     for (std::uint64_t i = 0; i < count; ++i) {
         const std::size_t e = 56 + 32 * i;
         m.ssts.push_back({ReadLE(bytes, e, 8), ReadLE(bytes, e + 8, 8),

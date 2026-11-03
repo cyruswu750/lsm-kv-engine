@@ -33,6 +33,7 @@ add_library(kv STATIC
     src/core/file_names.cc
     src/core/sst.cc
     src/core/manifest.cc
+    src/core/compaction.cc
     src/core/db.cc
 )
 

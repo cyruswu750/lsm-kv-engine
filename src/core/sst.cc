@@ -10,13 +10,6 @@ namespace kv {
 
 namespace {
 
-struct BlockEntry {
-    std::string_view key;
-    std::uint64_t sequence = 0;
-    ValueType type = ValueType::kPut;
-    std::string_view value;
-};
-
 bool IsValidType(std::uint8_t type) {
     return type == static_cast<std::uint8_t>(ValueType::kPut) ||
            type == static_cast<std::uint8_t>(ValueType::kDelete);
@@ -29,7 +22,7 @@ std::string BlockContext(std::uint64_t offset) {
 // Validates one complete data block (entries and trailer) and returns
 // views into it. Checks lengths against the block before slicing, so
 // a malformed length can never read or allocate past the block.
-Status ParseBlock(std::string_view block, std::vector<BlockEntry>& out) {
+Status ParseBlock(std::string_view block, std::vector<SstEntry>& out) {
     if (block.size() < kMinSstBlockSize) {
         return Status::Corruption("block length " +
                                   std::to_string(block.size()) +
@@ -53,7 +46,7 @@ Status ParseBlock(std::string_view block, std::vector<BlockEntry>& out) {
                                   " entries; only one is allowed");
     }
 
-    std::vector<BlockEntry> entries;
+    std::vector<SstEntry> entries;
     std::size_t pos = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::string context =
@@ -96,7 +89,7 @@ Status ParseBlock(std::string_view block, std::vector<BlockEntry>& out) {
         if (size > entries_size - pos) {
             return Status::Corruption(context + "entry extends past entries");
         }
-        BlockEntry entry;
+        SstEntry entry;
         entry.key = block.substr(pos + kSstEntryHeaderSize, key_len);
         entry.value =
             block.substr(pos + kSstEntryHeaderSize + key_len, value_len);
@@ -273,7 +266,7 @@ Status WithPath(const std::string& path, const Status& s) {
 Status ReadBlock(const RandomAccessFile& file,
                  const SstBlockHandle& handle,
                  std::string& buffer,
-                 std::vector<BlockEntry>& entries) {
+                 std::vector<SstEntry>& entries) {
     buffer.resize(handle.length);
     Status s = file.Read(handle.offset, handle.length, buffer.data());
     if (!s.ok()) {
@@ -349,6 +342,24 @@ Status SstBuilder::Add(std::string_view key,
     last_key_.assign(key);
     has_entries_ = true;
     return Status::Ok();
+}
+
+bool SstBuilder::CanAdd(std::string_view key, std::string_view value) const {
+    // Mirrors Add: the entry either joins the current block, which then ends
+    // with this key, or closes it (indexed by last_key_) and starts a new
+    // block ending with this key. Finish would then index the last block.
+    const std::size_t size = kSstEntryHeaderSize + key.size() + value.size();
+    const bool new_block =
+        block_entries_ > 0 && block_.size() + size > kSstBlockTarget;
+    std::uint64_t blocks = summary_.index.size() + 1;
+    std::uint64_t index_size =
+        index_size_ + kSstIndexEntryHeaderSize + key.size();
+    if (new_block) {
+        blocks += 1;
+        index_size += kSstIndexEntryHeaderSize + last_key_.size();
+    }
+    return blocks <= limits_.max_blocks &&
+           index_size <= limits_.max_index_size;
 }
 
 // Checks the limits before the block is written, so the index never grows
@@ -496,7 +507,7 @@ Status SstTable::Open(const std::filesystem::path& path,
     std::string previous_key;
     bool first = true;
     for (const SstBlockHandle& handle : summary.index) {
-        std::vector<BlockEntry> entries;
+        std::vector<SstEntry> entries;
         s = ReadBlock(*file, handle, buffer, entries);
         if (!s.ok()) {
             return s;
@@ -507,7 +518,7 @@ Status SstTable::Open(const std::filesystem::path& path,
                                       "first key is not greater than the "
                                       "previous block's last key");
         }
-        for (const BlockEntry& entry : entries) {
+        for (const SstEntry& entry : entries) {
             if (first) {
                 summary.smallest_key.assign(entry.key);
                 summary.min_sequence = entry.sequence;
@@ -551,7 +562,7 @@ Status SstTable::Get(std::string_view key,
         return s;
     }
     std::string buffer;
-    std::vector<BlockEntry> entries;
+    std::vector<SstEntry> entries;
     s = ReadBlock(*file, *it, buffer, entries);
     if (!s.ok()) {
         return s;
@@ -563,7 +574,7 @@ Status SstTable::Get(std::string_view key,
 
     const auto match = std::lower_bound(
         entries.begin(), entries.end(), key,
-        [](const BlockEntry& e, std::string_view k) {
+        [](const SstEntry& e, std::string_view k) {
             return BytewiseLess{}(e.key, k);
         });
     if (match == entries.end() || match->key != key) {
@@ -575,6 +586,75 @@ Status SstTable::Get(std::string_view key,
         result = LookupResult::kFound;
     }
     return Status::Ok();
+}
+
+Status SstIterator::Open(const SstTable& table,
+                         std::unique_ptr<SstIterator>& out) {
+    if (out) {
+        return Status::InvalidArgument(table.path() +
+                                       ": SST iterator output is not empty");
+    }
+    std::unique_ptr<SstIterator> it(new SstIterator(table));
+    Status s = RandomAccessFile::Open(table.path(), *table.syscalls_, it->file_);
+    if (!s.ok()) {
+        return s;
+    }
+    if (it->file_->size() != table.summary().file_size) {
+        return Status::Corruption(table.path() + ": size " +
+                                  std::to_string(it->file_->size()) +
+                                  " differs from the expected " +
+                                  std::to_string(table.summary().file_size));
+    }
+    s = it->LoadBlock(0);
+    if (!s.ok()) {
+        return s;
+    }
+    out = std::move(it);
+    return Status::Ok();
+}
+
+// Reads and validates block i (as at Open), or ends the iteration when i
+// is past the last block.
+Status SstIterator::LoadBlock(std::size_t i) {
+    const auto& index = table_->summary().index;
+    entries_.clear();
+    position_ = 0;
+    block_ = i;
+    if (i >= index.size()) {
+        return Status::Ok();
+    }
+    Status s = ReadBlock(*file_, index[i], buffer_, entries_);
+    if (!s.ok()) {
+        entries_.clear();
+        block_ = index.size();
+        return s;
+    }
+    if (i > 0 && !BytewiseLess{}(index[i - 1].last_key, entries_.front().key)) {
+        entries_.clear();
+        block_ = index.size();
+        return Status::Corruption(file_->path() + ": " +
+                                  BlockContext(index[i].offset) +
+                                  "first key is not greater than the "
+                                  "previous block's last key");
+    }
+    return Status::Ok();
+}
+
+Status SstIterator::Next() {
+    if (!Valid()) {
+        return Status::InvalidArgument(table_->path() +
+                                       ": SST iterator is not positioned");
+    }
+    if (++position_ < entries_.size()) {
+        return Status::Ok();
+    }
+    return LoadBlock(block_ + 1);
+}
+
+Status SstIterator::Close() {
+    entries_.clear();
+    block_ = table_->summary().index.size();
+    return file_ ? file_->Close() : Status::Ok();
 }
 
 }  // namespace kv

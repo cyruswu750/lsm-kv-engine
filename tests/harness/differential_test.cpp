@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -10,9 +11,12 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/db.h"
+#include "core/db_internal.h"
+#include "core/posix_file.h"
 #include "core/memtable.h"
 #include "core/types.h"
 #include "testing/manifest_builder.h"
@@ -40,6 +44,10 @@ namespace fs = std::filesystem;
 // The DbFlush* workloads use a 4 KiB memtable so that flushes, SST
 // lookups, and manifest publication happen throughout the run, and they
 // assert from the published MANIFEST that many flushes actually occurred.
+// They disable compaction, so every flushed SST stays live (the M2
+// behavior). DbCompactionPeriodicReopen uses the same memtable with
+// compaction triggered at 2 live SSTs, and asserts from the engine's named
+// checkpoints that flushes and compactions both happened repeatedly.
 
 constexpr int kSeedsPerRun = 20;
 constexpr std::size_t kSmallMemtableBytes = 4096;
@@ -64,6 +72,40 @@ std::uint64_t ReopenEvery() { return EnvOr("KV_DIFF_REOPEN_EVERY", 500); }
 // A deliberately loose lower bound, scaled with KV_DIFF_OPS (10 at the
 // pinned 5000 operations); actual counts are recorded per seed.
 std::uint64_t MinFlushesPerSeed() { return OpCount() / 500; }
+// Equally loose (5 at 5000 operations).
+std::uint64_t MinCompactionsPerSeed() { return OpCount() / 1000; }
+
+// Real syscalls, counting the engine's maintenance checkpoints.
+class MaintenanceCounter : public PosixSyscalls {
+public:
+    void Checkpoint(std::string_view name) override {
+        if (name == "flush.installed") {
+            ++flushes;
+        } else if (name == "compaction.installed") {
+            ++compactions;
+        }
+    }
+
+    std::uint64_t flushes = 0;
+    std::uint64_t compactions = 0;
+};
+
+struct DbWorkload {
+    std::uint64_t reopen_every = 0;
+    std::size_t memtable_bytes = Options{}.memtable_bytes;
+    std::size_t compaction_trigger = InternalOptions{}.compaction_trigger;
+    std::uint64_t min_flushes = 0;
+    std::uint64_t min_compactions = 0;
+    SstLimits limits;  // lowered to force multi-SST compaction output
+    std::size_t value_pad = 0;  // bytes appended to every Put value
+    std::uint32_t min_max_base_run = 0;  // required largest base run seen
+};
+
+// Logical runs in a parsed manifest: the base run counts once.
+std::uint64_t Runs(const test::RawManifest& m) {
+    return (m.base_run_count > 0 ? 1 : 0) +
+           (m.ssts.size() - m.base_run_count);
+}
 
 // SplitMix64: fully specified, so a seed yields the same operations with
 // any compiler or standard library.
@@ -243,10 +285,7 @@ protected:
         return FirstSeed() + static_cast<std::uint64_t>(GetParam());
     }
 
-    void RunDb(const std::string& workload,
-               std::uint64_t reopen_every,
-               std::size_t memtable_bytes = Options{}.memtable_bytes,
-               std::uint64_t min_flushes = 0);
+    void RunDb(const std::string& workload, const DbWorkload& w);
 
     test::TempDir tmp_;
 };
@@ -293,18 +332,29 @@ TEST_P(DifferentialTest, Memtable) {
 }
 
 void DifferentialTest::RunDb(const std::string& workload,
-                             std::uint64_t reopen_every,
-                             std::size_t memtable_bytes,
-                             std::uint64_t min_flushes) {
+                             const DbWorkload& w) {
     Rng rng(Seed());
     Trace trace(workload, Seed());
     const fs::path dir = tmp_.path() / "db";
     std::map<std::string, std::string> model;
+    const std::uint64_t reopen_every = w.reopen_every;
     Options options;
-    options.memtable_bytes = memtable_bytes;
+    options.memtable_bytes = w.memtable_bytes;
+    InternalOptions internal;
+    internal.compaction_trigger = w.compaction_trigger;
+    internal.sst_limits = w.limits;
+    MaintenanceCounter sys;
+    // The largest base run seen at any reopen or at the end.
+    std::uint32_t max_base_run = 0;
+    auto note_base_run = [&]() {
+        test::RawManifest m;
+        if (test::ReadManifest(dir, m)) {
+            max_base_run = std::max(max_base_run, m.base_run_count);
+        }
+    };
 
     std::unique_ptr<DB> db;
-    ASSERT_TRUE(DB::Open(dir, options, db).ok());
+    ASSERT_TRUE(DBOpener::Open(dir, options, internal, sys, db).ok());
     std::uint64_t reopens = 0;
 
     // Compares every known key, including deleted and never-written ones.
@@ -338,15 +388,19 @@ void DifferentialTest::RunDb(const std::string& workload,
         trace.Add("REOPEN after op " + std::to_string(index));
         ++reopens;
         db.reset();
-        const Status s = DB::Open(dir, options, db);
+        const Status s = DBOpener::Open(dir, options, internal, sys, db);
         if (!s.ok()) {
             return trace.Fail(index, "reopen failed: " + s.ToString());
         }
+        note_base_run();
         return compare_all(index, "after reopen");
     };
 
     for (std::size_t i = 0; i < OpCount(); ++i) {
-        const Op op = NextOp(rng);
+        Op op = NextOp(rng);
+        if (op.kind == Op::kPut && w.value_pad > 0) {
+            op.value.append(w.value_pad, 'p');
+        }
         trace.Add(std::to_string(i) + " " + Describe(op));
 
         if (op.kind == Op::kPut || op.kind == Op::kDelete) {
@@ -397,45 +451,108 @@ void DifferentialTest::RunDb(const std::string& workload,
         reopen_every == 0 ? 0 : OpCount() / reopen_every;
     EXPECT_EQ(reopens, periodic + 1);
 
-    // Evidence of flushes, read with the test-side manifest parser. Each
-    // flush publishes one generation and adds one SST; M2 never removes
-    // an SST, so the counts must agree.
+    // Evidence of maintenance. The engine reports each installed flush and
+    // compaction through a named checkpoint; each also publishes exactly
+    // one manifest generation, read here with the test-side parser.
     test::RawManifest manifest;
     ASSERT_TRUE(test::ReadManifest(dir, manifest));
-    const std::uint64_t flushes = manifest.generation - 1;
+    const std::uint64_t flushes = sys.flushes;
+    const std::uint64_t compactions = sys.compactions;
+    EXPECT_EQ(manifest.generation - 1, flushes + compactions);
     std::uint64_t sst_files = 0;
     for (const auto& entry : fs::directory_iterator(dir)) {
         if (entry.path().extension() == ".sst") {
             ++sst_files;
         }
     }
-    EXPECT_EQ(manifest.ssts.size(), flushes);
-    EXPECT_EQ(sst_files, flushes);
-    EXPECT_GE(flushes, min_flushes) << "workload=" << workload
-                                    << " seed=" << Seed();
+    // Cleanup removes every compacted input, so the live SSTs are the only
+    // SST files.
+    EXPECT_EQ(sst_files, manifest.ssts.size());
+    if (w.compaction_trigger == 0) {
+        // Without compaction every flushed SST stays live.
+        EXPECT_EQ(compactions, 0u);
+        EXPECT_EQ(manifest.ssts.size(), flushes);
+    } else {
+        // A mutation never ends with trigger or more logical runs.
+        EXPECT_LT(Runs(manifest), w.compaction_trigger);
+        // Each compaction needs at least one new flush first: an unchanged
+        // base run, however many SSTs it has, is never compacted again.
+        EXPECT_LE(compactions, flushes);
+    }
+    note_base_run();
+    EXPECT_GE(max_base_run, w.min_max_base_run);
+    EXPECT_GE(flushes, w.min_flushes) << "workload=" << workload
+                                      << " seed=" << Seed();
+    EXPECT_GE(compactions, w.min_compactions) << "workload=" << workload
+                                              << " seed=" << Seed();
     RecordProperty("seed", std::to_string(Seed()));
     RecordProperty("ops", std::to_string(OpCount()));
     RecordProperty("reopens", std::to_string(reopens));
     RecordProperty("flushes", std::to_string(flushes));
+    RecordProperty("compactions", std::to_string(compactions));
+    RecordProperty("compaction_trigger", std::to_string(w.compaction_trigger));
+    RecordProperty("max_base_run", std::to_string(max_base_run));
+    RecordProperty("final_base_run", std::to_string(manifest.base_run_count));
     // Where the data lived, so a run can show which filesystem it used.
     RecordProperty("db_dir", dir.string());
 }
 
 TEST_P(DifferentialTest, DbWithoutReopen) {
-    RunDb("DbWithoutReopen", 0);
+    RunDb("DbWithoutReopen", {});
 }
 
 TEST_P(DifferentialTest, DbPeriodicReopen) {
-    RunDb("DbPeriodicReopen", ReopenEvery());
+    DbWorkload w;
+    w.reopen_every = ReopenEvery();
+    RunDb("DbPeriodicReopen", w);
+}
+
+DbWorkload FlushWorkload(std::uint64_t reopen_every) {
+    DbWorkload w;
+    w.reopen_every = reopen_every;
+    w.memtable_bytes = kSmallMemtableBytes;
+    w.compaction_trigger = 0;
+    w.min_flushes = MinFlushesPerSeed();
+    return w;
 }
 
 TEST_P(DifferentialTest, DbFlushWithoutReopen) {
-    RunDb("DbFlushWithoutReopen", 0, kSmallMemtableBytes, MinFlushesPerSeed());
+    RunDb("DbFlushWithoutReopen", FlushWorkload(0));
 }
 
 TEST_P(DifferentialTest, DbFlushPeriodicReopen) {
-    RunDb("DbFlushPeriodicReopen", ReopenEvery(), kSmallMemtableBytes,
-          MinFlushesPerSeed());
+    RunDb("DbFlushPeriodicReopen", FlushWorkload(ReopenEvery()));
+}
+
+// The M3 workload: 4 KiB memtable, compaction at 2 live SSTs, reopen every
+// KV_DIFF_REOPEN_EVERY operations.
+TEST_P(DifferentialTest, DbCompactionPeriodicReopen) {
+    DbWorkload w;
+    w.reopen_every = ReopenEvery();
+    w.memtable_bytes = kSmallMemtableBytes;
+    w.compaction_trigger = 2;
+    w.min_flushes = MinFlushesPerSeed();
+    w.min_compactions = MinCompactionsPerSeed();
+    RunDb("DbCompactionPeriodicReopen", w);
+}
+
+// The same with at most three blocks per output SST and every Put value
+// padded by 600 bytes. A flush (under 4 KiB plus one entry) always fits in
+// three blocks, since any two consecutive blocks hold more than 4 KiB. The
+// live data (about 33 keys of several hundred bytes) needs more, so
+// compactions split their output into a multi-SST base run, and reopens
+// must keep the grouping.
+TEST_P(DifferentialTest, DbMultiOutputCompactionPeriodicReopen) {
+    DbWorkload w;
+    w.reopen_every = ReopenEvery();
+    w.memtable_bytes = kSmallMemtableBytes;
+    w.compaction_trigger = 2;
+    w.limits = SstLimits{3, kMaxSstIndexSize};
+    w.value_pad = 600;
+    w.min_flushes = MinFlushesPerSeed();
+    w.min_compactions = MinCompactionsPerSeed();
+    w.min_max_base_run = 2;
+    RunDb("DbMultiOutputCompactionPeriodicReopen", w);
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, DifferentialTest,

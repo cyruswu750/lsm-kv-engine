@@ -23,8 +23,11 @@ Status CheckMagicAndVersion(std::string_view data) {
     const std::uint32_t version = DecodeFixed32(data.data() + 8);
     if (version != kManifestVersion) {
         // Not covered by a checksum check first, like the WAL header.
-        return Status::UnsupportedFormat("unsupported manifest version " +
-                                         std::to_string(version));
+        return Status::UnsupportedFormat(
+            "unsupported manifest version " + std::to_string(version) +
+            (version == 1 ? " (an M2 database; this version reads only "
+                            "manifest version 2 and does not migrate)"
+                          : ""));
     }
     return Status::Ok();
 }
@@ -49,8 +52,15 @@ Status ValidateManifest(const Manifest& m) {
                                   " SSTs; the limit is " +
                                   std::to_string(kMaxManifestSsts));
     }
+    if (m.base_run_count > m.ssts.size()) {
+        return Status::Corruption("manifest base run count " +
+                                  std::to_string(m.base_run_count) +
+                                  " exceeds its SST count " +
+                                  std::to_string(m.ssts.size()));
+    }
 
     std::uint64_t max_id = m.active_wal_id;
+    std::uint64_t base_max = 0;  // greatest sequence in the base run
     std::unordered_set<std::uint64_t> ids;
     ids.insert(m.active_wal_id);
     for (std::size_t i = 0; i < m.ssts.size(); ++i) {
@@ -79,7 +89,16 @@ Status ValidateManifest(const Manifest& m) {
                 context + "max sequence " + std::to_string(sst.max_sequence) +
                 " exceeds checkpoint " + std::to_string(m.checkpoint));
         }
-        if (i > 0 && m.ssts[i - 1].max_sequence >= sst.min_sequence) {
+        // Base SSTs may overlap one another. Each flush run follows the
+        // whole base run and the previous flush run.
+        if (i < m.base_run_count) {
+            base_max = std::max(base_max, sst.max_sequence);
+        } else if (i == m.base_run_count) {
+            if (i > 0 && base_max >= sst.min_sequence) {
+                return Status::Corruption(
+                    context + "sequence range does not follow the base run");
+            }
+        } else if (m.ssts[i - 1].max_sequence >= sst.min_sequence) {
             return Status::Corruption(
                 context + "sequence range does not follow the previous SST");
         }
@@ -103,7 +122,7 @@ void EncodeManifest(const Manifest& m, std::string* dst) {
     PutFixed64(dst, m.checkpoint);
     PutFixed64(dst, m.active_wal_id);
     PutFixed32(dst, static_cast<std::uint32_t>(m.ssts.size()));
-    PutFixed32(dst, 0);
+    PutFixed32(dst, m.base_run_count);
     for (const ManifestSst& sst : m.ssts) {
         PutFixed64(dst, sst.file_id);
         PutFixed64(dst, sst.file_size);
@@ -135,7 +154,7 @@ Status DecodeManifest(std::string_view data, Manifest& out) {
     }
 
     const char* p = data.data();
-    if (DecodeFixed32(p + 12) != 0 || DecodeFixed32(p + 52) != 0) {
+    if (DecodeFixed32(p + 12) != 0) {
         return Status::Corruption("manifest reserved field is nonzero");
     }
     const std::uint32_t count = DecodeFixed32(p + 48);
@@ -157,6 +176,7 @@ Status DecodeManifest(std::string_view data, Manifest& out) {
     m.next_file_id = DecodeFixed64(p + 24);
     m.checkpoint = DecodeFixed64(p + 32);
     m.active_wal_id = DecodeFixed64(p + 40);
+    m.base_run_count = DecodeFixed32(p + 52);
     m.ssts.resize(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         const char* e = p + kManifestHeaderSize + i * kManifestSstEntrySize;
@@ -184,7 +204,8 @@ Status ReadManifestFile(const std::filesystem::path& path,
     const std::string& name = file->path();
     const std::uint64_t size = file->size();
 
-    // Identify the version before applying version 1 size limits.
+    // Read the magic and version first, so an unsupported version is
+    // reported before the version 2 size limits are applied.
     if (size < kVersionPrefixSize) {
         return Status::Corruption(name + ": manifest truncated: " +
                                   std::to_string(size) + " bytes");

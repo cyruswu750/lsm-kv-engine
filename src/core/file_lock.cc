@@ -17,13 +17,18 @@ FileLock::~FileLock() {
         // Explicit unlock also releases the lock for any forked duplicate of
         // this descriptor. Errors are unreportable here; close releases the
         // descriptor regardless.
-        ::flock(fd_, LOCK_UN);
-        ::close(fd_);
+        syscalls_->Flock(fd_, LOCK_UN);
+        syscalls_->Close(fd_);
     }
 }
 
+int PosixSyscalls::Flock(int fd, int operation) {
+    return ::flock(fd, operation);
+}
+
 Status LockFile(const std::filesystem::path& path,
-                std::unique_ptr<FileLock>& out) {
+                std::unique_ptr<FileLock>& out,
+                PosixSyscalls& syscalls) {
     if (out) {
         return Status::InvalidArgument(path.string() +
                                        ": lock: output lock is not empty");
@@ -36,16 +41,17 @@ Status LockFile(const std::filesystem::path& path,
 
     // Allocate before opening so allocation failure cannot leak the fd.
     // From here on, the handle's destructor closes the fd on every failure.
-    std::unique_ptr<FileLock> lock(new FileLock(path.string()));
+    std::unique_ptr<FileLock> lock(new FileLock(path.string(), syscalls));
 
-    lock->fd_ = ::open(path.c_str(), O_RDONLY | O_CREAT | O_CLOEXEC, 0644);
+    lock->fd_ =
+        syscalls.Open(path.c_str(), O_RDONLY | O_CREAT | O_CLOEXEC, 0644);
     if (lock->fd_ < 0) {
         const int err = errno;
         return Status::IOError(path.string() + ": open lock file: " +
                                std::generic_category().message(err));
     }
 
-    while (::flock(lock->fd_, LOCK_EX | LOCK_NB) != 0) {
+    while (syscalls.Flock(lock->fd_, LOCK_EX | LOCK_NB) != 0) {
         const int err = errno;
         if (err == EINTR) {
             continue;

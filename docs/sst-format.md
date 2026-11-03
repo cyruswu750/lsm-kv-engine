@@ -1,8 +1,9 @@
-# M2 On-Disk Format: SSTables, Manifest, and Directory Rules
+# On-Disk Format: SSTables, Manifest, and Directory Rules
 
-Status: the M2 format implemented in `src/core/`. It extends
-design.md sections 4, 5, and 8. The WAL record encoding is unchanged from
-design.md section 6 (WAL v1); only WAL file names change. Where this
+Status: the on-disk format implemented in `src/core/` as of M3: the M2
+formats, except that the manifest is version 2 (section 4). It extends
+design.md sections 4, 5, 8, and 9. The WAL record encoding is unchanged
+from design.md section 6 (WAL v1); only WAL file names change. Where this
 document and design.md differ, design.md is authoritative. Section 13
 records the differences that were resolved by updating design.md.
 
@@ -256,7 +257,11 @@ more temporary SST until a publication covers its ID. This is a loss of
 write availability, not of data. M2 neither splits a flush into several
 SSTs nor caps memtable_bytes; either would be a separate change.
 
-## 4. Manifest format, version 1
+## 4. Manifest format, version 2 (M3)
+
+M3 reads and writes manifest version 2 only. Version 1 (the M2 format)
+and every other version are rejected as UnsupportedFormat (section 4.3).
+There is no migration, no fallback to version 1, and no downgrade.
 
 The manifest is one record that fills the whole file. Each publication
 replaces the file by rename. It is never appended to.
@@ -264,16 +269,19 @@ replaces the file by rename. It is never appended to.
 | Offset | Bytes | Field | Rule |
 |---:|---:|---|---|
 | 0 | 8 | magic | ASCII `KVMAN001` |
-| 8 | 4 | version | 1 |
+| 8 | 4 | version | 2 |
 | 12 | 4 | reserved | 0 |
 | 16 | 8 | generation | at least 1 |
 | 24 | 8 | next_file_id | greater than every file ID referenced below |
 | 32 | 8 | checkpoint_sequence | at least every listed max_sequence; 0 before any flush |
 | 40 | 8 | active_wal_id | at least 1 |
 | 48 | 4 | sst_count | at most `kMaxManifestSsts = 1,048,576` |
-| 52 | 4 | reserved | 0 |
+| 52 | 4 | base_run_count | at most sst_count (section 4.1) |
 | 56 | 32 x sst_count | SST entries | see below |
 | 56 + 32 x sst_count | 4 | manifest_crc32c | CRC-32C of every byte before it |
+
+The layout is the version 1 layout. Only the version value and the
+meaning of offset 52 (reserved in version 1) differ.
 
 SST entry (32 bytes):
 
@@ -285,29 +293,71 @@ SST entry (32 bytes):
 | 24 | 8 | max_sequence | at least min_sequence, at most checkpoint_sequence |
 
 So the file size is exactly 60 + 32 x sst_count bytes: 60 bytes at
-minimum and 33,554,492 bytes at most (`kMaxManifestSize`).
+minimum and 33,554,492 bytes at most (`kMaxManifestSize`). All file IDs,
+including active_wal_id, are distinct. The manifest has no level or
+key-range fields.
 
-SST entries are listed oldest first. Their sequence intervals are
-strictly ordered and disjoint: entry i's max_sequence is less than entry
-i+1's min_sequence. All file IDs, including active_wal_id, are distinct.
-The manifest has no level or key-range fields.
+### 4.1 Runs
 
-Validation order:
+A run is the set of SSTs that one publication added. A flush adds a run
+of one SST. A compaction adds the base run: zero or more SSTs that
+together hold the merged state of every SST that was live before it.
+Every live SST is a compaction input, so the base run is always the
+oldest run.
+
+- The first `base_run_count` entries form the base run. The remaining
+  entries are flush runs of one SST each, oldest first.
+- `base_run_count = 0`: there is no base run. Either no compaction has
+  published yet, or the last compaction's output was empty.
+- `base_run_count = 1`: one base SST.
+- `base_run_count = k >= 2`: k base SSTs.
+- Base SSTs are listed in key order with strictly non-overlapping key
+  ranges: the largest key of entry i is less (BytewiseLess) than the
+  smallest key of entry i+1. Key ranges are not stored. Open derives them
+  from the validated SSTs (the first entry's key, and the last index
+  key) and checks this rule after section 3.4 validation. A violation is
+  Corruption.
+- Base SST sequence intervals may overlap one another.
+- Every flush-run SST is newer than the entire base run: its min_sequence
+  exceeds every base max_sequence.
+- Flush-run SSTs have strictly ordered, disjoint intervals: entry i's
+  max_sequence is less than entry i+1's min_sequence.
+
+Logical run count = (1 if base_run_count > 0, else 0) +
+(sst_count - base_run_count). Compaction is triggered by this count, not
+by sst_count (docs/m3-design.md section 3).
+
+### 4.2 Validation order
 
 1. MANIFEST that is not a regular file: Corruption.
 2. Size below 12: Corruption. Wrong magic: Corruption. Version other than
-   1: UnsupportedFormat. The magic and version are not checked against
+   2: UnsupportedFormat. The magic and version are not checked against
    the CRC first, so a damaged version field is reported as
    UnsupportedFormat, as with the WAL file header.
 3. Size below 60 or above `kMaxManifestSize`: Corruption. This is checked
    with fstat before the whole file is read, which bounds allocation.
-4. CRC mismatch, nonzero reserved fields, generation 0, active_wal_id 0,
-   sst_count above the maximum, file size different from
-   60 + 32 x sst_count, an invalid SST entry, duplicate IDs, overlapping
-   or unordered intervals, a max_sequence above the checkpoint, or a
-   next_file_id that does not exceed every referenced ID: Corruption.
+4. CRC mismatch, a nonzero reserved field (offset 12), generation 0,
+   active_wal_id 0, sst_count above the maximum, file size different from
+   60 + 32 x sst_count, base_run_count above sst_count, an invalid SST
+   entry, duplicate IDs, a max_sequence above the checkpoint, a violation
+   of the section 4.1 sequence rules, or a next_file_id that does not
+   exceed every referenced ID: Corruption.
+5. After each referenced SST is validated (section 9 step 3), the base
+   run's key order: Corruption.
 
 A malformed existing MANIFEST is never replaced or repaired.
+
+### 4.3 Version boundary
+
+An M2 database (manifest version 1) opened by M3, or a manifest of any
+version other than 2, fails at step 2 with UnsupportedFormat. This
+happens before any WAL is read, truncated, or appended, before any SST is
+read, and before any publication or orphan removal, so no existing
+database file changes. As for any directory that has MANIFEST, Open takes
+the lock first, which creates an empty `LOCK` only if none exists.
+
+An M2 executable opening an M3 database fails the same way: it accepts
+only version 1, and it checks the version before anything else.
 
 ## 5. Sequence and checkpoint rules
 
@@ -323,26 +373,35 @@ A malformed existing MANIFEST is never replaced or repaired.
   WAL therefore continues above the checkpoint.
 - A flush publishes checkpoint = last_sequence at the time of the flush.
   The new SST's sequences are greater than the previous checkpoint
-  because the memtable holds only records newer than it. So intervals
-  stay disjoint and newest-last.
-- Lookup order: memtable, then SSTs from newest to oldest. The first
-  value or tombstone found is the answer. This is valid because every
-  memtable sequence exceeds every SST sequence, and SST intervals are
-  disjoint and ordered.
+  because the memtable holds only records newer than it. So it is newer
+  than every listed SST, including the whole base run.
+- A compaction keeps the checkpoint and the active WAL unchanged.
+- Lookup order: the memtable; then the flush-run SSTs from newest to
+  oldest; then the base run, where at most one SST can hold the key (the
+  one whose key range contains it, found by binary search). The first
+  value or tombstone found is the answer. This is exact because every
+  memtable sequence exceeds every SST sequence, flush runs are newer than
+  the base run and ordered among themselves, and a key appears in at most
+  one base SST.
 - Recovery at a last_sequence of 2^64-1 (from the WAL or the checkpoint)
   succeeds, and Get works. Every later Put or Delete returns
   InvalidArgument before any flush or WAL I/O (D-006).
 
-## 6. Counter exhaustion
+## 6. Counter and capacity exhaustion
 
 | Counter | Exhausted when | Behavior |
 |---|---|---|
 | sequence | last_sequence = 2^64-1 | Put/Delete return InvalidArgument before any I/O; the handle stays usable |
-| generation | the current generation = 2^64-1 | a flush that would publish returns InvalidArgument before any I/O; the mutation is rejected; the handle stays usable for reads |
-| file ID | the next allocatable ID is above 2^64-3 (a flush needs two IDs, and next_file_id must stay representable) | as for generation |
-| SST count | the manifest already lists `kMaxManifestSsts` SSTs | as for generation |
+| generation | the current generation = 2^64-1 | a flush or compaction that would publish returns InvalidArgument before any I/O; the mutation is rejected; the handle stays usable for reads |
+| file ID, flush | the next allocatable ID is above 2^64-3 (a flush needs two IDs, and next_file_id must stay representable) | as for generation |
+| file ID, compaction | before any I/O: the next allocatable ID is above 2^64-2 (no ID for even one output). During the merge: an output beyond the first finds no ID | before I/O: as for generation. During the merge: InvalidArgument, NeedsRecovery, durable state unchanged |
+| SST count, flush | the manifest already lists the SST-entry limit (`kMaxManifestSsts`) | as for generation |
+| SST count, compaction | the merged output needs more than the entry limit minus (compaction_trigger - 1) SSTs, which leaves room for the flushes that lead to the next compaction | InvalidArgument during the merge, NeedsRecovery, durable state unchanged |
 
-No counter wraps around. Each is checked before maintenance I/O begins.
+No counter wraps around. The checks that need no I/O run before any
+maintenance I/O begins. The two in-merge cases are the remaining
+capacity limits: the database's live data must fit in about 2^20 SSTs,
+each within section 3.6's block and index limits.
 
 ## 7. File-ID allocation and orphans
 
@@ -421,7 +480,7 @@ In order, under the lock:
    non-regular referenced file is Corruption. A directory listing is
    never used to rebuild or replace missing state.
 3. Validate each SST by streaming (section 3.4) and keep its index in
-   memory.
+   memory. Then check the base run's key order (section 4.1).
 4. Replay the active WAL (design.md section 7, with the checkpoint rule
    from section 5). An incomplete trailing record is truncated and the
    file is synced before any append. Only the active WAL is referenced in
@@ -493,14 +552,13 @@ descriptor is held per SST between calls.
 
 ## 12. Syscall mediation (seam inventory)
 
-Mediated by `PosixSyscalls` (injectable through `DBOpener`): open (data,
-manifest, WAL, SST, and directory-sync descriptors), read, pread, write,
-fstat, ftruncate, fsync (files and directories), close, rename, and
-unlink.
-
-Still real system calls in M2, to be mediated for the M3 crash simulator:
-lstat (`InspectPath`), opendir/readdir/closedir (`ListDirectory`), mkdir
-(`CreateDirectory`), and open/flock/close of `LOCK` (`LockFile`).
+Every filesystem operation goes through `PosixSyscalls` (injectable
+through `DBOpener`): open, read, pread, write, fstat, ftruncate, fsync
+(files and directories), close, rename, unlink, lstat (`InspectPath`),
+directory listing (`ListDirectory`), mkdir (`CreateDirectory`), and the
+open, flock, and close of `LOCK` (`LockFile`). The engine also reports
+named non-syscall boundaries through `PosixSyscalls::Checkpoint`
+(docs/m3-design.md section 2).
 
 ## 13. Resolved differences from the earlier design.md text
 
@@ -518,3 +576,6 @@ design.md section 8 was updated to state each of these choices.
   high-water mark.
 - A read error or block corruption found by Get does not invalidate the
   handle (section 11, decision D-015).
+- Compaction output is one base run of key-partitioned SSTs, compaction
+  is triggered by logical run count, and the manifest is version 2 only
+  (sections 4 and 4.1; design.md sections 8 and 9, updated for M3).

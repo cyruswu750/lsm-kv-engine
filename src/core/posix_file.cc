@@ -251,6 +251,16 @@ int PosixSyscalls::Close(int fd) {
     return ::close(fd);
 }
 
+int PosixSyscalls::Lstat(const char* path, struct stat* st) {
+    return ::lstat(path, st);
+}
+
+int PosixSyscalls::Mkdir(const char* path, mode_t mode) {
+    return ::mkdir(path, mode);
+}
+
+void PosixSyscalls::Checkpoint(std::string_view) {}
+
 PosixSyscalls& DefaultPosixSyscalls() {
     static PosixSyscalls syscalls;
     return syscalls;

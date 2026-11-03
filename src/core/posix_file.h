@@ -8,17 +8,20 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "status.h"
 #include "writable_file.h"
 
 namespace kv {
 
-// Syscall seam for the POSIX file operations in this header. Each method
-// has the contract of the matching POSIX call: on failure return -1 and
-// set errno. The base class calls the real syscalls. Tests may subclass it
-// to script results; the production control flow runs unchanged on top.
+// Syscall seam for every filesystem operation the engine performs. Each
+// method has the contract of the matching POSIX call: on failure return -1
+// and set errno. The base class calls the real syscalls. Tests may subclass
+// it to script results or to run the engine on a simulated filesystem; the
+// production control flow runs unchanged on top.
 class PosixSyscalls {
 public:
     PosixSyscalls() = default;
@@ -36,9 +39,23 @@ public:
     virtual int Fsync(int fd);
     virtual int Rename(const char* from, const char* to);
     virtual int Unlink(const char* path);
+    virtual int Lstat(const char* path, struct stat* st);
+    virtual int Mkdir(const char* path, mode_t mode);
+    virtual int Flock(int fd, int operation);
+
+    // Replaces names with the entries of the directory at path, excluding
+    // "." and "..", in unspecified order (opendir, readdir, closedir). On
+    // failure returns -1 with errno set and leaves names unchanged.
+    virtual int ListDirectory(const char* path,
+                              std::vector<std::string>& names);
 
     // As on Linux, the descriptor counts as released even when this fails.
     virtual int Close(int fd);
+
+    // Marks a named engine boundary that is not a syscall (for example,
+    // after a mutation is applied in memory). The default does nothing;
+    // the crash simulator treats each call as a crash point.
+    virtual void Checkpoint(std::string_view name);
 };
 
 // Stateless real-syscall instance used when no seam is supplied.

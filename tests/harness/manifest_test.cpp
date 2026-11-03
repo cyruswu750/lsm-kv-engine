@@ -29,42 +29,48 @@ bool Contains(const std::string& haystack, std::string_view needle) {
 }
 
 // Computed outside this code base (separate script, own CRC-32C): version
-// 1, generation 3, next file ID 6, checkpoint 9, active WAL 5, and SSTs
-// {2, 157 bytes, [1, 4]} and {4, 200 bytes, [6, 9]}.
+// 2, generation 5, next file ID 9, checkpoint 12, active WAL 8, a base run
+// of two SSTs with overlapping intervals, {2, 157 bytes, [1, 6]} and
+// {3, 200 bytes, [2, 5]}, then one flush run {7, 180 bytes, [8, 12]}.
 constexpr char kGoldenManifest[] =
-    "\x4b\x56\x4d\x41\x4e\x30\x30\x31\x01\x00\x00\x00\x00\x00\x00\x00"
-    "\x03\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00"
-    "\x09\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00"
-    "\x02\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00"
+    "\x4b\x56\x4d\x41\x4e\x30\x30\x31\x02\x00\x00\x00\x00\x00\x00\x00"
+    "\x05\x00\x00\x00\x00\x00\x00\x00\x09\x00\x00\x00\x00\x00\x00\x00"
+    "\x0c\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00"
+    "\x03\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00"
     "\x9d\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00"
-    "\x04\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00"
-    "\xc8\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00"
-    "\x09\x00\x00\x00\x00\x00\x00\x00\x2a\x8f\x84\x45";
+    "\x06\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00"
+    "\xc8\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00"
+    "\x05\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00"
+    "\xb4\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00"
+    "\x0c\x00\x00\x00\x00\x00\x00\x00\x8e\xa0\xb6\xaf";
 const std::string kGolden(kGoldenManifest, sizeof(kGoldenManifest) - 1);
 
 Manifest GoldenManifest() {
     Manifest m;
-    m.generation = 3;
-    m.next_file_id = 6;
-    m.checkpoint = 9;
-    m.active_wal_id = 5;
-    m.ssts = {{2, 157, 1, 4}, {4, 200, 6, 9}};
+    m.generation = 5;
+    m.next_file_id = 9;
+    m.checkpoint = 12;
+    m.active_wal_id = 8;
+    m.base_run_count = 2;
+    m.ssts = {{2, 157, 1, 6}, {3, 200, 2, 5}, {7, 180, 8, 12}};
     return m;
 }
 
 RawManifest GoldenRaw() {
     RawManifest m;
-    m.generation = 3;
-    m.next_file_id = 6;
-    m.checkpoint = 9;
-    m.active_wal_id = 5;
-    m.ssts = {{2, 157, 1, 4}, {4, 200, 6, 9}};
+    m.generation = 5;
+    m.next_file_id = 9;
+    m.checkpoint = 12;
+    m.active_wal_id = 8;
+    m.base_run_count = 2;
+    m.ssts = {{2, 157, 1, 6}, {3, 200, 2, 5}, {7, 180, 8, 12}};
     return m;
 }
 
 bool Equal(const Manifest& a, const Manifest& b) {
     if (a.generation != b.generation || a.next_file_id != b.next_file_id ||
         a.checkpoint != b.checkpoint || a.active_wal_id != b.active_wal_id ||
+        a.base_run_count != b.base_run_count ||
         a.ssts.size() != b.ssts.size()) {
         return false;
     }
@@ -96,7 +102,8 @@ TEST(Manifest, EncodingMatchesGoldenBytes) {
     EncodeManifest(GoldenManifest(), &encoded);
     EXPECT_EQ(encoded, "prefix" + kGolden);
     EXPECT_EQ(ManifestBytes(GoldenRaw()), kGolden);
-    EXPECT_EQ(kGolden.size(), kManifestMinSize + 2 * kManifestSstEntrySize);
+    EXPECT_EQ(kGolden.size(), kManifestMinSize + 3 * kManifestSstEntrySize);
+    EXPECT_EQ(RunCount(GoldenManifest()), 2u);  // the base run counts once
 }
 
 TEST(Manifest, GoldenBytesDecode) {
@@ -110,7 +117,9 @@ TEST(Manifest, GoldenBytesDecode) {
     EXPECT_EQ(m.next_file_id, 2u);
     EXPECT_EQ(m.checkpoint, 0u);
     EXPECT_EQ(m.active_wal_id, 1u);
+    EXPECT_EQ(m.base_run_count, 0u);
     EXPECT_TRUE(m.ssts.empty());
+    EXPECT_EQ(RunCount(m), 0u);
 }
 
 TEST(Manifest, ExtremeLegalValuesRoundTrip) {
@@ -119,6 +128,7 @@ TEST(Manifest, ExtremeLegalValuesRoundTrip) {
     m.next_file_id = kMax;
     m.checkpoint = kMax;
     m.active_wal_id = kMax - 1;
+    m.base_run_count = 1;
     m.ssts = {{kMax - 2, kMax, kMax, kMax}};
     ASSERT_TRUE(ValidateManifest(m).ok());
     std::string bytes;
@@ -156,8 +166,9 @@ TEST(Manifest, EveryBitFlipFailsClosed) {
     }
 }
 
+// Version 1 is the M2 format: deliberately unsupported (no migration).
 TEST(Manifest, UnknownVersionIsUnsupportedFormat) {
-    for (std::uint32_t version : {0u, 2u, 0xffffffffu}) {
+    for (std::uint32_t version : {0u, 1u, 3u, 0xffffffffu}) {
         RawManifest m = GoldenRaw();
         m.version = version;
         ExpectDecodeFails(ManifestBytes(m), Code::UnsupportedFormat,
@@ -167,6 +178,11 @@ TEST(Manifest, UnknownVersionIsUnsupportedFormat) {
         ExpectDecodeFails(ManifestBytes(m).substr(0, 12),
                           Code::UnsupportedFormat, "version");
     }
+    RawManifest v1 = GoldenRaw();
+    v1.version = 1;
+    v1.base_run_count = 0;
+    ExpectDecodeFails(ManifestBytes(v1), Code::UnsupportedFormat,
+                      "an M2 database");
     RawManifest m = GoldenRaw();
     m.magic = "KVMAN002";
     ExpectDecodeFails(ManifestBytes(m), Code::Corruption, "bad magic");
@@ -180,38 +196,53 @@ TEST(Manifest, InvalidFieldsWithCorrectChecksumAreCorruption) {
     };
     const Case cases[] = {
         {"reserved1", [](RawManifest& m) { m.reserved1 = 1; }, "reserved"},
-        {"reserved2", [](RawManifest& m) { m.reserved2 = 0x100; }, "reserved"},
+        {"base run count above SST count",
+         [](RawManifest& m) { m.base_run_count = 4; },
+         "base run count 4 exceeds its SST count 3"},
         {"generation 0", [](RawManifest& m) { m.generation = 0; },
          "generation is zero"},
         {"active WAL 0", [](RawManifest& m) { m.active_wal_id = 0; },
          "active WAL ID is zero"},
-        {"next ID = active", [](RawManifest& m) { m.next_file_id = 5; },
-         "does not exceed referenced ID 5"},
+        {"next ID = active", [](RawManifest& m) { m.next_file_id = 8; },
+         "does not exceed referenced ID 8"},
         {"next ID below SST",
          [](RawManifest& m) {
              m.active_wal_id = 1;
-             m.next_file_id = 4;
+             m.next_file_id = 7;
          },
-         "does not exceed referenced ID 4"},
+         "does not exceed referenced ID 7"},
         {"file ID 0", [](RawManifest& m) { m.ssts[0].file_id = 0; },
          "file ID is zero"},
         {"duplicate SST IDs", [](RawManifest& m) { m.ssts[1].file_id = 2; },
          "duplicate file ID"},
-        {"SST ID = WAL ID", [](RawManifest& m) { m.ssts[1].file_id = 5; },
+        {"SST ID = WAL ID", [](RawManifest& m) { m.ssts[2].file_id = 8; },
          "duplicate file ID"},
         {"tiny SST", [](RawManifest& m) { m.ssts[0].file_size = 96; },
          "below the minimum SST size"},
         {"min sequence 0", [](RawManifest& m) { m.ssts[0].min_sequence = 0; },
          "invalid sequence range"},
-        {"min > max", [](RawManifest& m) { m.ssts[0].min_sequence = 5; },
+        {"min > max", [](RawManifest& m) { m.ssts[0].min_sequence = 7; },
          "invalid sequence range"},
-        {"overlap", [](RawManifest& m) { m.ssts[1].min_sequence = 4; },
+        {"flush run overlaps the base run",
+         [](RawManifest& m) { m.ssts[2].min_sequence = 6; },
+         "does not follow the base run"},
+        // Without the base run, the overlapping entries are flush runs.
+        {"base run count 0", [](RawManifest& m) { m.base_run_count = 0; },
          "does not follow the previous SST"},
-        {"newest first",
-         [](RawManifest& m) { std::swap(m.ssts[0], m.ssts[1]); },
+        {"base run count 1", [](RawManifest& m) { m.base_run_count = 1; },
+         "does not follow the base run"},
+        {"flush run listed first",
+         [](RawManifest& m) { std::swap(m.ssts[0], m.ssts[2]); },
+         "does not follow the base run"},
+        {"flush runs out of order",
+         [](RawManifest& m) {
+             m.base_run_count = 1;
+             m.ssts[1] = {3, 200, 9, 12};
+             m.ssts[2] = {7, 180, 7, 8};
+         },
          "does not follow the previous SST"},
-        {"above checkpoint", [](RawManifest& m) { m.checkpoint = 8; },
-         "exceeds checkpoint 8"},
+        {"above checkpoint", [](RawManifest& m) { m.checkpoint = 11; },
+         "exceeds checkpoint 11"},
     };
     for (const Case& c : cases) {
         SCOPED_TRACE(c.name);
@@ -222,7 +253,7 @@ TEST(Manifest, InvalidFieldsWithCorrectChecksumAreCorruption) {
 }
 
 TEST(Manifest, CountAndSizeMustAgreeWithinBounds) {
-    for (std::uint32_t count : {0u, 1u, 3u, kMaxManifestSsts,
+    for (std::uint32_t count : {0u, 1u, 2u, 4u, kMaxManifestSsts,
                                 kMaxManifestSsts + 1, 0xffffffffu}) {
         SCOPED_TRACE(count);
         RawManifest m = GoldenRaw();

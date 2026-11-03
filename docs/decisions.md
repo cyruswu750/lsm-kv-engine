@@ -141,7 +141,8 @@ or measurable performance. Update validation status as tests are added.
   history. Rename gives readers the old or the new generation, never a
   mixture.
 - Cost: Each flush rewrites 60 + 32 x (live SSTs) bytes. Without M3
-  compaction the SST list grows with every flush. The list is capped at
+  compaction the SST list grows with every flush. (M3: the manifest is
+  version 2, D-025.) The list is capped at
   2^20 entries; at the cap, a flush is refused (D-013).
 - Validation: `Manifest.*` (golden bytes, every truncation, every bit
   flip, resealed invalid fields, unknown versions),
@@ -318,7 +319,7 @@ or measurable performance. Update validation status as tests are added.
   production code to be meaningful.
 - Cost: lstat, directory listing, mkdir, and the LOCK file's open and
   flock still use real syscalls. They are listed in docs/sst-format.md
-  section 12 for the M3 simulator.
+  section 12 for the M3 simulator. (M3: D-020 mediates them too.)
 - Validation: every `PublishFaultTest` case asserts that its rule fired.
   `SstTest.ReadsGoThroughTheSyscallSeam`,
   `ManifestFileTest.ReadsThroughTheSeamAndNamesThePath`.
@@ -357,3 +358,139 @@ or measurable performance. Update validation status as tests are added.
 - Validation: `UnsyncedManifestTest.OpenSyncsDirectoryBeforeRetiringOrAcknowledging`,
   `UnsyncedManifestTest.FailedOpenDirectorySyncRetiresNothing` (both
   failed before the change; B-005).
+
+## D-017: Full compaction of every live SST (M3)
+
+- Decision: Before a mutation, after any pending flush, compaction runs
+  synchronously when the logical run count reaches an internal threshold
+  (default 4, minimum 2, 0 disables; not in public Options). Every live
+  SST is an input. Per key the greatest sequence wins; shadowed versions
+  and winning tombstones are dropped.
+- Alternatives: Leveled or partial compaction (tombstones would have to
+  be kept, since an unselected file could resurrect a value).
+- Reason: Coverage of every older version is trivially true, so dropping
+  tombstones is safe.
+- Cost: Each compaction rewrites all live data (write amplification grows
+  with the database size between compactions).
+- Validation: `DBM3Test.*`, `CompactionInputTest.*`,
+  `Seeds/DifferentialTest.DbCompactionPeriodicReopen/*`.
+
+## D-018: Compaction keeps the checkpoint and the active WAL (M3)
+
+- Decision: A compaction publishes generation + 1 with the same checkpoint
+  and active WAL. Each output's sequence range comes from its emitted
+  entries. A file ID is allocated only per created output; an empty
+  merge publishes no SST and keeps the checkpoint, so sequences never
+  restart.
+- Alternatives: Recompute the checkpoint (unnecessary; the WAL is not
+  involved).
+- Reason: Compaction changes only SST layout.
+- Cost: None measured.
+- Validation: `DBM3Test.AllDeletedLeavesNoSstAndSequencesContinue`,
+  `DBM3Test.CompactionDropsShadowedVersionsAndWinningTombstones`.
+
+## D-019: Compaction errors follow the flush classification (M3)
+
+- Decision: Counter exhaustion before I/O: InvalidArgument, handle usable.
+  Any failure before the manifest's directory sync: NeedsRecovery. After
+  it: an input unlink failure is not reported, and a cleanup directory
+  sync failure is IOError with NeedsRecovery. Inputs are deleted only
+  after the new manifest is durable.
+- Alternatives: Treat compaction as best effort and ignore its errors
+  (could hide a lost publication).
+- Reason: The same reasoning as D-012.
+- Cost: A failed compaction blocks the triggering mutation.
+- Validation: `CompactionFaultTest.*` (14 + 10 injection points, EIO and
+  ENOSPC, and exceptions).
+
+## D-020: Mediate every filesystem call, plus named checkpoints (M3)
+
+- Decision: `PosixSyscalls` also covers lstat, mkdir, directory listing,
+  and flock; `InspectPath`, `ListDirectory`, `CreateDirectory`,
+  `LockFile`, and `FileLock` use it. `Checkpoint(name)` marks non-syscall
+  boundaries (`write.applied`, `flush.installed`,
+  `compaction.installed`). Production defaults are the real syscalls and
+  a no-op checkpoint.
+- Alternatives: A separate virtual filesystem interface.
+- Reason: The crash simulator must see every call.
+- Cost: One virtual call per filesystem operation.
+- Validation: `CrashSimTest.EngineDirectoryHelpersUseTheSeam`; the crash
+  matrix runs on a path that does not exist on the real filesystem.
+
+## D-021: A simulated crash freezes a snapshot and kills the instance (M3)
+
+- Decision: After the k-th completed state-changing call or checkpoint,
+  the simulator copies its state and throws `SimulatedCrash`. A dead
+  instance fails every later call with EIO (close and unlock succeed) and
+  never throws, so destructors and error paths cannot change the
+  snapshot.
+- Alternatives: Returning an error status (not a termination).
+- Reason: Termination must not run any further engine I/O.
+- Cost: Test-only.
+- Validation: `CrashSimTest.CrashFreezesTheSnapshotAndKillsTheInstance`.
+
+## D-022: Two crash models (M3)
+
+- Decision: Process crash keeps volatile state. Unsynced-state loss keeps
+  only durable file contents reachable through durable directory entries
+  from the root. File sync and directory sync persist different things.
+- Alternatives: Modeling writeback order inside files.
+- Reason: The two models bracket the guarantees the engine relies on.
+- Cost: Neither model is evidence of real power-loss behavior.
+- Validation: `CrashSimTest.*`, `CrashMutationTest.*`.
+
+## D-023: A response-aware recovery oracle (M3)
+
+- Decision: After recovery, the state over every key a workload's
+  mutations name (the empty key included) plus a never-written key must
+  equal all acknowledged mutations, optionally plus the in-flight one.
+  Crashes before the first successful Open are judged by the directory
+  table from the recovered directory contents, independently of the
+  engine.
+- Alternatives: Comparing only the last key, or only acknowledged state.
+- Reason: An operation may be durable before its response is observed.
+- Cost: Test-only.
+- Validation: `CrashOracleTest.*`, `Workloads/CrashMatrixTest.*`.
+
+## D-024: Compaction output is one key-partitioned base run (M3)
+
+- Decision: The merged output is split between keys before any per-SST
+  limit (blocks, index) would be exceeded. All outputs are
+  synced, made durable by one directory sync, and published by one
+  manifest. The output count is limited to the manifest SST limit minus
+  (trigger - 1), leaving room for the flushes before the next compaction.
+- Alternatives: A single output (the database's live data would be capped
+  by one SST, as little as 1,023 keys of 64 KiB). Raising the per-SST
+  limits (weakens B-006).
+- Reason: Keeps the B-006 allocation bounds per file.
+- Cost: Live data must fit in about 2^20 SSTs; a larger merge fails with
+  InvalidArgument and NeedsRecovery.
+- Validation: `DBM3Test.CompactionSplitsOutputAtExactBoundariesIntoOneBaseRun`,
+  `DBM3Test.CompactionExhaustionFailsBeforePublication`,
+  `Seeds/DifferentialTest.DbMultiOutputCompactionPeriodicReopen/*`.
+
+## D-025: Manifest version 2 only; no M2 migration (M3)
+
+- Decision: The manifest keeps the version 1 layout but is version 2,
+  with `base_run_count` at offset 52. Version 1 (M2 databases) and every
+  other version are UnsupportedFormat before any file changes. There is no
+  migration, dual-version reader, or downgrade. Key ranges are derived at
+  Open, not stored.
+- Alternatives: A conditional version 1 writer, or migration (more states
+  and code for a format without users).
+- Reason: One manifest format and one validation path.
+- Cost: M2 databases cannot be opened; an M2 executable rejects M3
+  databases.
+- Validation: `DBM3Test.M2DatabaseIsUnsupportedAndLeftUnchanged`
+  (a fixture written by the v0.2-m2 build), `Manifest.*`.
+
+## D-026: Trigger compaction by logical run count (M3)
+
+- Decision: The base run counts once, each flush run once.
+- Alternatives: Counting SSTs (a multi-SST base alone would reach the
+  threshold and be merged again before every mutation).
+- Reason: A new compaction needs trigger - 1 new flushes, before or after
+  reopen.
+- Cost: None.
+- Validation: `DBM3Test.UnchangedBaseRunIsNotCompactedAgainAfterReopen`;
+  the compaction differential workloads assert compactions <= flushes.
