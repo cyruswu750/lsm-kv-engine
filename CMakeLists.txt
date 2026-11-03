@@ -44,6 +44,15 @@ target_include_directories(kv PUBLIC
 
 target_compile_features(kv PUBLIC cxx_std_20)
 
+# ---- Benchmarks ---------------------------------------------------------------
+option(KV_BUILD_BENCH "Build the benchmark driver (use a Release build without sanitizers)" OFF)
+if(KV_BUILD_BENCH)
+  if(KV_SANITIZE OR NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+    message(WARNING "Benchmarks should be built as Release without KV_SANITIZE")
+  endif()
+  add_subdirectory(bench)
+endif()
+
 # ---- Tests ------------------------------------------------------------------
 include(CTest)
 if(BUILD_TESTING)
