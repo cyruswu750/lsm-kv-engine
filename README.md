@@ -23,14 +23,16 @@ Verification status of the M2 code (commit c6a410f):
 - Release tag: `v0.2-m2` (annotated) is on `6d702e4`; the commits
   after `c6a410f` change documentation only.
 
-Verification status of the M3 code:
+Verification status of the M3 code (merge commit 2845a02):
 
-- Local: before it was committed, the M3 code passed 493 tests in a
-  Debug ASan/UBSan build with test data on ext4, with no skipped or
-  disabled tests and no sanitizer report (docs/failure-matrix.md).
-  The committed code differs from that tree only in two comments.
-- Not yet done: remote CI for the M3 commits, the owner's review of
-  M3, and a release tag.
+- Remote CI: GitHub Actions run 41596578142 on 2845a02 (the push to
+  `main`) succeeded (Debug, ASan and UBSan, 493 tests passed), as did
+  run 41594389993 for pull request #1.
+- Local: before it was committed, the M3 code passed the same 493 tests
+  in a Debug ASan/UBSan build with test data on ext4, with no skipped or
+  disabled tests and no sanitizer report. The committed code differs from
+  that tree only in two comments.
+- Release tag: `v0.3-m3` (annotated) is on `2845a02`.
 
 ## Status: M3 (full compaction, crash simulator)
 
