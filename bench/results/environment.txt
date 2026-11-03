@@ -1,0 +1,20 @@
+date: 2026-11-02T20:30:59-08:00
+source: frozen M4 snapshot /home/cyrus/kv-m4-accept2/src, tree identity 263619eb8ef3d982095c5533b16eb99c03da68e603b8f360ccbb6e0ec44b0427, git base c6a410fb29f71f9e9d029bd5fec40276cc51bf4e
+binary: /home/cyrus/kv-m4-bench2/build/bench/kv_bench sha256 dbe10181c585b78dc0345f433682e3c060f65be441b912be185416f11727804b
+build: Release, KV_SANITIZE=OFF, BUILD_TESTING=OFF, KV_BUILD_BENCH=ON
+CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++
+CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+CMAKE_GENERATOR:INTERNAL=Ninja
+c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+cpu:  AMD Ryzen 9 7945HX with Radeon Graphics x 32 logical
+ram: 7905443840 bytes total
+kernel: Linux 6.18.54.1-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Tue Oct  6 19:13:07 UTC 2026 x86_64
+Linux version 6.18.54.1-microsoft-standard-WSL2 (root@9b80f41eb17c) (gcc (GCC) 13.2.0, GNU ld (GNU Binutils) 2.41) #1 SMP PREEMPT_DYNAMIC Tue Oct  6 19:13:07 UTC 2026
+environment: WSL2
+data dir: /home/cyrus/kv-m4-bench2/data
+TARGET SOURCE   FSTYPE OPTIONS
+/      /dev/sdd ext4   rw,relatime,discard,errors=remount-ro,data=ordered
+NAME SIZE ROTA MODEL
+sdd    1T    1 Virtual Disk
+cpu governor: unavailable
+parameters: see scripts/run_benchmarks.sh header (seed 42, key 16 B, value 100 B, insert 20000 ops / 64 KiB memtable / trigger 4, thresholds 20000 ops over 10000 ids, 10% deletes, read setup 200000 keys / 256 KiB memtable / trigger 4, 20000 warmup, 50000 lookups per kind, 3 repetitions)

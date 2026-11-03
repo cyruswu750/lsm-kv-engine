@@ -35,6 +35,7 @@ using test::RawManifest;
 using test::RawManifestSst;
 using test::RawRecord;
 using test::RawSst;
+using test::RawSstV2;
 using test::ReadBytesOrEmpty;
 using test::WalFileHeaderBytes;
 
@@ -127,7 +128,7 @@ TEST_F(DBM3Test, CompactionPublishesOneOutputAndRetiresInputs) {
     EXPECT_EQ(m.active_wal_id, 5u);
     EXPECT_EQ(m.base_run_count, 1u);
     const std::string expected =
-        RawSst({{{"a", 1, kRawPut, "1"}, {"b", 2, kRawPut, "2"}}});
+        RawSstV2({{{"a", 1, kRawPut, "1"}, {"b", 2, kRawPut, "2"}}});
     ASSERT_EQ(m.ssts.size(), 1u);
     EXPECT_EQ(m.ssts[0].file_id, 6u);
     EXPECT_EQ(m.ssts[0].file_size, expected.size());
@@ -158,7 +159,7 @@ TEST_F(DBM3Test, CompactionDropsShadowedVersionsAndWinningTombstones) {
 
     const RawManifest m = Manifest();
     ASSERT_EQ(m.ssts.size(), 1u);
-    const std::string expected = RawSst({{{"k", 3, kRawPut, "v2"}}});
+    const std::string expected = RawSstV2({{{"k", 3, kRawPut, "v2"}}});
     EXPECT_EQ(ReadBytesOrEmpty(Db() / test::RawSstName(m.ssts[0].file_id)),
               expected);
     EXPECT_EQ(m.ssts[0].min_sequence, 3u);
@@ -306,9 +307,9 @@ TEST_F(DBM3Test, CompactionSplitsOutputAtExactBoundariesIntoOneBaseRun) {
     ASSERT_EQ(m.ssts.size(), 2u);
     // {a, b, m, z}: each entry fills a block, so each output holds two.
     EXPECT_EQ(ReadBytesOrEmpty(Db() / test::RawSstName(m.ssts[0].file_id)),
-              RawSst({{{"a", 2, kRawPut, kBig}}, {{"b", 4, kRawPut, kBig}}}));
+              RawSstV2({{{"a", 2, kRawPut, kBig}}, {{"b", 4, kRawPut, kBig}}}));
     EXPECT_EQ(ReadBytesOrEmpty(Db() / test::RawSstName(m.ssts[1].file_id)),
-              RawSst({{{"m", 1, kRawPut, kBig}}, {{"z", 3, kRawPut, kBig}}}));
+              RawSstV2({{{"m", 1, kRawPut, kBig}}, {{"z", 3, kRawPut, kBig}}}));
     // Disjoint keys, overlapping sequence intervals [2, 4] and [1, 3].
     EXPECT_EQ(m.ssts[0].min_sequence, 2u);
     EXPECT_EQ(m.ssts[0].max_sequence, 4u);

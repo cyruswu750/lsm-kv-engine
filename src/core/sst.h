@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "bloom.h"
 #include "memtable.h"
 #include "posix_file.h"
 #include "status.h"
@@ -20,7 +21,8 @@ namespace kv {
 // SSTable version 1 (docs/sst-format.md section 3).
 
 inline constexpr std::string_view kSstMagic{"KVSST001", 8};
-inline constexpr std::uint32_t kSstVersion = 1;
+inline constexpr std::uint32_t kSstVersion1 = 1;  // no filter
+inline constexpr std::uint32_t kSstVersion2 = 2;  // with a Bloom filter
 inline constexpr std::size_t kSstBlockTarget = 4096;
 inline constexpr std::size_t kSstEntryHeaderSize = 17;
 inline constexpr std::size_t kSstBlockTrailerSize = 8;
@@ -50,6 +52,14 @@ struct SstEntry {
     std::string_view value;
 };
 
+// Counters for SstTable::Get (docs/m4-design.md section 4).
+struct SstReadStats {
+    std::uint64_t range_rejections = 0;   // key outside the SST's key range
+    std::uint64_t filter_rejections = 0;  // the filter answered "absent"
+    std::uint64_t block_reads = 0;        // data blocks requested
+    std::uint64_t block_bytes = 0;        // bytes requested for them
+};
+
 struct SstBlockHandle {
     std::string last_key;
     std::uint64_t offset = 0;
@@ -63,6 +73,8 @@ struct SstSummary {
     std::uint64_t max_sequence = 0;
     std::string smallest_key;
     std::vector<SstBlockHandle> index;
+    std::uint32_t version = kSstVersion1;
+    BloomFilter filter;  // empty for version 1
 
     // The last key of the last block. A valid SST has at least one block.
     const std::string& largest_key() const {
@@ -76,6 +88,7 @@ struct SstSummary {
 struct SstLimits {
     std::uint32_t max_blocks = kMaxSstBlocks;
     std::uint64_t max_index_size = kMaxSstIndexSize;
+    std::uint32_t max_filter_keys = kMaxSstFilterKeys;  // version 2 only
 };
 
 // Streams entries into file as data blocks, then the index and footer.
@@ -83,7 +96,12 @@ struct SstLimits {
 // After any error the builder and the file contents are unusable.
 class SstBuilder {
 public:
-    explicit SstBuilder(WritableFile& file, SstLimits limits = {});
+    // bloom_bits_per_key > 0 writes version 2 with a filter at that many
+    // bits per key (at most kMaxFilterBitsPerKey); 0 writes version 1.
+    explicit SstBuilder(WritableFile& file,
+                        SstLimits limits = {},
+                        std::uint32_t bloom_bits_per_key =
+                            kDefaultBloomBitsPerKey);
 
     SstBuilder(const SstBuilder&) = delete;
     SstBuilder& operator=(const SstBuilder&) = delete;
@@ -121,6 +139,8 @@ private:
 
     WritableFile& file_;
     SstLimits limits_;
+    std::uint32_t bits_per_key_;
+    BloomFilterBuilder filter_;
     std::uint64_t index_size_ = kSstIndexTrailerSize;  // encoded so far
     std::string block_;
     std::uint32_t block_entries_ = 0;
@@ -162,11 +182,17 @@ public:
         return path_;
     }
 
-    // Probes the one block that may hold key and validates it again. On
-    // kFound, *value receives the value; otherwise it is unchanged.
+    // Looks up key: a key outside [smallest, largest] is absent without
+    // I/O; then, unless use_filter is false, a negative filter answer
+    // (version 2) means absent without I/O; otherwise the one block that
+    // may hold key is read and validated again. On kFound, *value receives
+    // the value; otherwise it is unchanged. If stats is given, exactly one
+    // of its range_rejections, filter_rejections, or block_reads grows.
     Status Get(std::string_view key,
                LookupResult& result,
-               std::string* value) const;
+               std::string* value,
+               SstReadStats* stats = nullptr,
+               bool use_filter = true) const;
 
 private:
     friend class SstIterator;

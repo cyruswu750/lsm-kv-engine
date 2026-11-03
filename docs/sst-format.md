@@ -1,11 +1,13 @@
 # On-Disk Format: SSTables, Manifest, and Directory Rules
 
-Status: the on-disk format implemented in `src/core/` as of M3: the M2
-formats, except that the manifest is version 2 (section 4). It extends
-design.md sections 4, 5, 8, and 9. The WAL record encoding is unchanged
-from design.md section 6 (WAL v1); only WAL file names change. Where this
-document and design.md differ, design.md is authoritative. Section 13
-records the differences that were resolved by updating design.md.
+Status: the on-disk format implemented in `src/core/` as of M4. SSTs are
+version 1 (no filter, read only) or version 2 (with a Bloom filter,
+written since M4; section 3.7). The manifest is version 2 only (section
+4). It extends design.md sections 4, 5, 8, and 9. The WAL record encoding
+is unchanged from design.md section 6 (WAL v1); only WAL file names
+change. Where this document and design.md differ, design.md is
+authoritative. Section 13 records the differences that were resolved by
+updating design.md.
 
 All integers are unsigned little-endian. Fields are serialized
 individually, never by dumping C++ structs. All checksums are standard
@@ -44,17 +46,22 @@ an engine name. Such names are unrelated entries.
 WAL and SST files share one ID space: one ID names at most one file kind.
 A temporary file has the same ID as its final name.
 
-## 3. SSTable format, version 1
+## 3. SSTable format, versions 1 and 2
 
 An SST is immutable once renamed to its final name. It contains:
 
 ```
-[data block 0] ... [data block n-1] [index block] [footer]
+version 1: [data block 0] ... [data block n-1] [index block] [footer]
+version 2: [data block 0] ... [data block n-1] [filter block] [index block] [footer]
 ```
 
-There is no file header. In version 1 the regions are contiguous in this
-order, with no gaps or overlaps. The index locates every data block.
-There is no filter region (section 3.5).
+There is no file header. The regions are contiguous in this order, with
+no gaps or overlaps. The index locates every data block. Version 1 has no
+filter; version 2 always has exactly one filter block (section 3.7). Data
+blocks and the index block are identical in both versions. "Data region"
+below means the bytes before the filter (version 2) or before the index
+(version 1); its size D is filter_offset (version 2) or index_offset
+(version 1).
 
 ### 3.1 Data block
 
@@ -124,22 +131,24 @@ Index limits, enforced by both the writer and the reader (section 3.6):
 
 ### 3.3 Footer (48 bytes, at the end of the file)
 
-| Offset | Bytes | Field | Version 1 rule |
-|---:|---:|---|---|
-| 0 | 4 | footer_crc32c | CRC-32C of footer bytes [4, 48) |
-| 4 | 8 | index_offset | equals the end of the last data block |
-| 12 | 8 | index_length | index_offset + index_length + 48 = file size |
-| 20 | 8 | filter_offset | must be 0 |
-| 28 | 8 | filter_length | must be 0 |
-| 36 | 4 | version | 1 |
-| 40 | 8 | magic | ASCII `KVSST001` |
+| Offset | Bytes | Field | Version 1 rule | Version 2 rule |
+|---:|---:|---|---|---|
+| 0 | 4 | footer_crc32c | CRC-32C of footer bytes [4, 48) | same |
+| 4 | 8 | index_offset | equals the end of the last data block | filter_offset + filter_length |
+| 12 | 8 | index_length | index_offset + index_length + 48 = file size | same |
+| 20 | 8 | filter_offset | must be 0 | equals the end of the last data block (D) |
+| 28 | 8 | filter_length | must be 0 | 28 .. `kMaxSstFilterSize` |
+| 36 | 4 | version | 1 | 2 |
+| 40 | 8 | magic | ASCII `KVSST001` | same |
 
 The footer has no reserved bytes. Any extension needs a new version.
 Every version must keep `version` and `magic` as the last 12 bytes of the
 file, so a reader can identify a version before trusting the rest of the
 layout.
 
-The smallest SST is 25 + 24 + 48 = 97 bytes (`kMinSstFileSize`).
+The smallest SST is 25 + 24 + 48 = 97 bytes (`kMinSstFileSize`), a
+version 1 file. The smallest version 2 file is 25 + 28 + 24 + 48 = 125
+bytes.
 
 ### 3.4 Validation
 
@@ -154,17 +163,26 @@ these checks in this order:
    recorded in the manifest. Otherwise Corruption. A truncated SST is
    always Corruption. There is no tail repair for SSTs.
 2. Footer (the size is at least 97 because the manifest requires it):
-   wrong magic gives Corruption; version other than 1 gives
-   UnsupportedFormat; footer CRC mismatch gives Corruption; a nonzero
-   filter field gives Corruption; a region rule violation gives
-   Corruption. The region rules are: index_offset at least 25, and
-   index_offset + index_length + 48 = file size, computed without
-   overflow. Then index_length must be at least 24 and at most
-   min(floor(index_offset / 25), 1,048,576) x (16 + 65,536) + 8, and at
-   most `kMaxSstIndexSize`: each block takes at least 25 bytes of the
-   data region, and each index entry at most 16 + 65,536 bytes. A
-   violation is Corruption, decided from the footer alone, before the
-   index is allocated or read.
+   wrong magic gives Corruption; a version other than 1 or 2 gives
+   UnsupportedFormat; footer CRC mismatch gives Corruption; a region rule
+   violation gives Corruption. Version 1 region rules: both filter
+   fields 0, index_offset at least 25, and index_offset + index_length +
+   48 = file size. Version 2 region rules: filter_offset at least 25,
+   filter_length at least 28 and at most `kMaxSstFilterSize`,
+   index_offset = filter_offset + filter_length, and index_offset +
+   index_length + 48 = file size. All sums are computed without overflow
+   (each operand is first checked against the file size). Then
+   index_length must be at least 24 and at most min(floor(D / 25),
+   1,048,576) x (16 + 65,536) + 8, and at most `kMaxSstIndexSize`: each
+   block takes at least 25 bytes of the data region, and each index entry
+   at most 16 + 65,536 bytes. A violation is Corruption, decided from the
+   footer alone, before the index or filter is allocated or read.
+2a. Version 2 only, the filter (section 3.7): its 16-byte header is read
+   first; an unknown filter_version or hash_id gives UnsupportedFormat;
+   the key count, probe count, and bit-array size are then checked
+   against their bounds (Corruption), all before the bit array is
+   allocated; then the whole block is read and its CRC checked
+   (Corruption).
 3. Index, read as exactly index_length bytes: CRC, block_count at least 1
    and at most `kMaxSstBlocks`, exactly block_count entries consuming exactly
    index_length - 8 bytes, the key length limit, contiguous block offsets
@@ -178,27 +196,39 @@ these checks in this order:
    Delete with value_len 0, sequence at least 1, an entry region larger
    than 4096 only with entry_count 1, keys strictly increasing in
    BytewiseLess order across the whole file (one version per key), and
-   the block's last key equal to its index last_key. Any violation is
-   Corruption.
+   the block's last key equal to its index last_key. Version 2 also: the
+   filter reports every entry's key as possibly present (no false
+   negative), and the total entry count equals the filter's key_count.
+   Any violation is Corruption.
 5. The observed minimum and maximum sequence over all entries equal the
    manifest's min_sequence and max_sequence for that file. Otherwise
    Corruption.
 
 The SST must be nonempty: a valid SST has at least one entry.
 
-Get re-reads the one candidate block and validates it again under step 4,
-using the index kept in memory from Open. A Get-time block failure returns
-Corruption (or IOError for a read error) from that Get.
+Get first rejects a key outside the SST's [smallest key, largest key]
+range without I/O. For a version 2 SST it then queries the filter kept in
+memory from Open; a negative answer means the key is absent from this SST
+(no I/O). Otherwise Get re-reads the one candidate block and validates it
+again under step 4, using the index kept in memory from Open. A positive
+filter answer never short-cuts that exact lookup. A Get-time block
+failure returns Corruption (or IOError for a read error) from that Get.
 
 ### 3.5 Compatibility
 
-- Version 1 has no filter. M4 is expected to add filters as SST version
-  2, placing the filter region between the last data block and the index
-  (`filter_offset` = end of data, `index_offset` = filter_offset +
-  filter_length). An M2 reader reports version 2 as UnsupportedFormat. An
-  M4 reader must keep accepting version 1 files (no filter) next to
-  version 2 files. M4 defines the filter encoding and the version 2 rule
-  for an absent filter.
+- Version 1 has no filter. Version 2 places the filter between the last
+  data block and the index. M4 writes version 2 (a filter is always
+  present: version 2 with filter_length 0 is Corruption) and reads both
+  versions, so one database may mix filterless version 1 SSTs and
+  filter-bearing version 2 SSTs; lookup simply skips the filter query for
+  version 1. This is SST-level compatibility only: the database must still
+  have a version 2 manifest (section 4.3), so M2 databases remain
+  unsupported.
+- Older readers (M2 and M3) accept only SST version 1 and check the
+  version (the last 12 bytes) before anything else, so a version 2 SST is
+  UnsupportedFormat for them. Because an M3 database already needs an
+  M3-or-later reader (manifest version 2), M4 SSTs make a database
+  readable only by M4 or later.
 - M3 compaction reads SSTs sequentially, block by block, using the same
   block validation as step 4.
 
@@ -256,6 +286,80 @@ mutation that triggers a flush is refused, and each attempt leaves one
 more temporary SST until a publication covers its ID. This is a loss of
 write availability, not of data. M2 neither splits a flush into several
 SSTs nor caps memtable_bytes; either would be a separate change.
+
+### 3.7 Filter block (SST version 2)
+
+One Bloom filter per SST covers every entry's key, including tombstones,
+so a negative answer proves that the SST holds no version of the key.
+
+Layout (filter_length bytes at filter_offset):
+
+| Offset | Bytes | Field | Rule |
+|---:|---:|---|---|
+| 0 | 4 | filter_version | 1 (this layout) |
+| 4 | 4 | hash_id | 1 (KVHASH1, below) |
+| 8 | 4 | key_count n | 1 .. `kMaxSstFilterKeys` = 4,194,304, and at most floor(D / 17); equals the SST's entry count |
+| 12 | 4 | num_probes k | 1 .. 30 |
+| 16 | B | bits | B = filter_length - 20; 8 <= B <= max(8, 8 x n) |
+| 16 + B | 4 | filter_crc32c | CRC-32C of bytes [0, 16 + B) |
+
+The bit array has m = 8 x B bits. Bit number b (0 <= b < m) is bit
+(b mod 8) of byte floor(b / 8), counting from the least significant bit
+(mask 1 << (b mod 8)).
+
+KVHASH1 (all arithmetic on unsigned 64-bit integers, modulo 2^64):
+- a = FNV-1a 64 of the key bytes: start at 0xcbf29ce484222325; for each
+  byte, a = (a XOR byte) x 0x100000001b3. The empty key gives the offset
+  basis.
+- mix(z) is the SplitMix64 finalizer: z ^= z >> 30;
+  z *= 0xbf58476d1ce4e5b9; z ^= z >> 27; z *= 0x94d049bb133111eb;
+  z ^= z >> 31.
+- h1 = mix(a); h2 = mix(a XOR 0x9e3779b97f4a7c15) OR 1 (always odd).
+- Probe i (0 <= i < k) sets or tests bit ((h1 + i x h2) mod 2^64) mod m.
+
+The hash is fixed by this text, never by a library (std::hash may change
+between builds). Golden vectors for KVHASH1 and for two complete filters
+come from an independent script (`scripts/bloom_reference.py`) and are
+checked in `tests/harness/bloom_test.cpp`.
+
+Builder rules (the reader does not assume them):
+- bits_per_key is an internal setting, 1 .. 64, default 10. 0 disables
+  filters, and the writer then produces version 1 SSTs. Filterless output
+  has no filter key limit: only the block and index limits of section
+  3.6 apply to it.
+- k = round(bits_per_key x 0.69) = floor((bits_per_key x 69 + 50) / 100),
+  clamped to 1 .. 30; 7 for the default.
+- B = max(8, ceil(n x bits_per_key / 8)) bytes. The minimum filter
+  (one key) is 8 bytes of bits, 28 bytes in all.
+- The builder keeps one 64-bit FNV-1a value per key (8n bytes, at most
+  8 x `kMaxSstFilterKeys` = 32 MiB) until it is destroyed. At Finish it
+  also holds, briefly, the bit array, the encoded block (header, a copy of
+  the bits, CRC), and the in-memory filter decoded from that block (a
+  further copy), so its filter-related peak is 8n + 3B + 20 bytes: at
+  most 128 MiB at 64 bits per key and 2^22 keys, about 47 MiB at the
+  default 10 bits per key. It refuses a key that would exceed `kMaxSstFilterKeys` or make the
+  filter exceed `kMaxSstFilterSize`. Like the block and index limits,
+  compaction splits its output before that point (`SstBuilder::CanAdd`);
+  a single flush that exceeds it fails (the B-006 large-memtable case).
+
+Reader rules and limits:
+- `kMaxSstFilterSize` = 8 x `kMaxSstFilterKeys` + 20 = 33,554,452 bytes
+  (32 MiB of bits plus header and CRC) bounds the filter block that Open
+  reads. Open then copies the bit array (B bytes) into the in-memory
+  filter and frees the block when it returns, so its filter-related peak
+  is 2B + 20 bytes (at most about 64 MiB), and B bytes stay resident per
+  open SST. The checks of section 3.4 step 2a run before the block is
+  allocated: filter_length from
+  the footer, then the 16-byte header (versions, then n, k, and B
+  against the bounds above, with 8 x n computed in 64 bits). A file
+  whose size satisfies the footer but whose header claims impossible
+  sizes is rejected without reading the bit array.
+- An unknown filter_version or hash_id is UnsupportedFormat. Every other
+  violation (CRC, n, k, B, a false negative for a stored key, a count
+  mismatch) is Corruption: Open fails, and a damaged filter
+  is never used as a negative answer.
+- The validated filter (n, k, m, bits) stays in memory with the index.
+  Get computes KVHASH1 once per probed SST.
 
 ## 4. Manifest format, version 2 (M3)
 
@@ -579,3 +683,5 @@ design.md section 8 was updated to state each of these choices.
 - Compaction output is one base run of key-partitioned SSTs, compaction
   is triggered by logical run count, and the manifest is version 2 only
   (sections 4 and 4.1; design.md sections 8 and 9, updated for M3).
+- Bloom filters are carried by SST version 2 (section 3.7); design.md
+  section 9 states that version 1 SSTs stay readable (M4).

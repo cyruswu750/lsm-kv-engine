@@ -455,7 +455,7 @@ or measurable performance. Update validation status as tests are added.
 ## D-024: Compaction output is one key-partitioned base run (M3)
 
 - Decision: The merged output is split between keys before any per-SST
-  limit (blocks, index) would be exceeded. All outputs are
+  limit (blocks, index, filter keys) would be exceeded. All outputs are
   synced, made durable by one directory sync, and published by one
   manifest. The output count is limited to the manifest SST limit minus
   (trigger - 1), leaving room for the flushes before the next compaction.
@@ -479,7 +479,7 @@ or measurable performance. Update validation status as tests are added.
 - Alternatives: A conditional version 1 writer, or migration (more states
   and code for a format without users).
 - Reason: One manifest format and one validation path.
-- Cost: M2 databases cannot be opened; an M2 executable rejects M3
+- Cost: M2 databases cannot be opened; an M2 executable rejects M3 and M4
   databases.
 - Validation: `DBM3Test.M2DatabaseIsUnsupportedAndLeftUnchanged`
   (a fixture written by the v0.2-m2 build), `Manifest.*`.
@@ -494,3 +494,65 @@ or measurable performance. Update validation status as tests are added.
 - Cost: None.
 - Validation: `DBM3Test.UnchangedBaseRunIsNotCompactedAgainAfterReopen`;
   the compaction differential workloads assert compactions <= flushes.
+
+## D-027: Bloom filters in SST version 2 (M4)
+
+- Decision: Each SST written by M4 is version 2 and holds one Bloom
+  filter of every stored key, tombstones included, between the data
+  blocks and the index (docs/sst-format.md section 3.7). The hash is
+  defined by the format (FNV-1a 64 and SplitMix64 finalizers, double
+  hashing), with 10 bits per key and k = 7 by default. Version 1 SSTs stay
+  readable in the same database.
+- Alternatives: Filters in separate files or in the manifest; std::hash
+  (not stable across builds).
+- Reason: Missing-key lookups skip SSTs without reading data blocks.
+- Cost: About 1.25 bytes of memory and file per key; one hash per probed
+  SST.
+- Validation: `Bloom.*`, `BloomSstTest.*`, `DBM4Test.*`,
+  `Seeds/DifferentialTest.DbMixedFilterPeriodicReopen/*`; measured in
+  bench/results/summary.md.
+
+## D-028: A damaged filter fails Open (M4)
+
+- Decision: CRC, size, key-count, and probe-count violations, a key count
+  different from the SST's entries, and any stored key that the filter
+  would deny are Corruption at Open. Unknown filter or hash versions are
+  UnsupportedFormat.
+- Alternatives: Ignoring a bad filter (a damaged filter could silently
+  hide data).
+- Reason: A negative answer must never come from an unchecked filter.
+- Cost: One filter probe per stored key at Open.
+- Validation: `BloomSstTest.MalformedFiltersWithValidChecksumsFailOpen`,
+  `BloomSstTest.EveryFilterBitFlipAndTruncationFailsClosed`.
+
+## D-029: Bounded filter memory (M4)
+
+- Decision: At most 2^22 keys per filter-bearing SST. The reader allocates
+  the filter block (at most 33,554,452 bytes) only after the footer and
+  the 16-byte header passed their bounds, then copies its bit array once
+  (peak 2B + 20 bytes). The builder keeps 8 bytes per key and, at Finish,
+  three copies of the bit array (peak 8n + 3B + 20 bytes, at most 128 MiB).
+  Compaction splits at the key limit; filterless output has none.
+- Alternatives: Bounding the filter only by the file size (a sparse file
+  makes that cheap, as in B-006).
+- Reason: B-006's allocation rule applied to filters.
+- Cost: A flush of more than 2^22 keys fails (the large-memtable case of
+  B-006).
+- Validation: `BloomSstTest.ImpossibleFilterSizeIsRejectedBeforeTheBitArrayIsRead`,
+  `BloomBuilderTest.FilterKeyLimitStopsTheBuilderBeforeWriting`,
+  `DBM4Test.CompactionRollsOverAtTheFilterKeyLimit`,
+  `DBM4Test.FlushOverTheFilterKeyLimitFailsClosed`,
+  `DBM4Test.FilterlessOutputIgnoresTheFilterKeyLimit`.
+
+## D-030: Internal counters and benchmark-only switches (M4)
+
+- Decision: `DbStats` counts lookups (candidates, range and filter
+  rejections, data-block requests and bytes) and successful write bytes
+  (WAL, flush SSTs, compaction SSTs, metadata). `bypass_bloom_queries`
+  and the benchmark driver's sync bypass are internal; the sync bypass
+  exists only in bench/kv_bench.cpp.
+- Alternatives: Public statistics or Options.
+- Reason: Measurements without changing the public API.
+- Cost: A few counter updates per call.
+- Validation: `DBM4Test.CountersFollowTheirDefinitions`,
+  `DBM4Test.BypassChangesRequestsButNotAnswers`.

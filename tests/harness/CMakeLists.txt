@@ -19,7 +19,9 @@ add_executable(kv_tests
   compaction_test.cpp
   db_m3_test.cpp
   crash_sim_test.cpp
-  crash_matrix_test.cpp)
+  crash_matrix_test.cpp
+  bloom_test.cpp
+  db_m4_test.cpp)
 target_link_libraries(kv_tests PRIVATE kv GTest::gtest_main)
 
 include(GoogleTest)

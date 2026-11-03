@@ -170,7 +170,7 @@ All SSTs form one level of runs (§8). Before the next mutation, after any pendi
 
 This trades higher write amplification (each compaction rewrites all live data) for a simple coverage proof and, with compaction enabled at a fixed threshold, bounded run counts between maintenance calls (a lookup probes at most one SST per run). This is not a bound on total memory or data size. Measure that cost (§11). Partial compaction must keep tombstones: dropping one because its own inputs lack an older value is incorrect, since an unselected file may resurrect that value.
 
-Bloom filters summarize all keys present in an SST, including tombstones. Negative means skip that SST; positive means inspect it, not that the key exists. False positives are allowed, false negatives are not. Version the stable hash/encoding in the SST format spec; never rely on unspecified std::hash persistence. The filter block is checksummed; corrupt filter metadata fails SST open with Corruption, never an unchecked negative.
+Bloom filters summarize all keys present in an SST, including tombstones. Negative means skip that SST; positive means inspect it, not that the key exists. False positives are allowed, false negatives are not. Version the stable hash/encoding in the SST format spec; never rely on unspecified std::hash persistence. The filter block is checksummed; corrupt filter metadata fails SST open with Corruption, never an unchecked negative. M4 carries filters in SST version 2 (docs/sst-format.md section 3.7) and also checks at Open that the filter contains every stored key. Filterless version 1 SSTs remain readable beside version 2 SSTs; this is SST-level compatibility only, since the database still requires manifest version 2.
 
 ## 10. Verification and evidence
 
@@ -199,7 +199,7 @@ Ablations:
 
 Write amplification = (WAL bytes + flush SST bytes + compaction SST bytes) / successful user mutation bytes, with user bytes defined as key+value for Put and key for Delete. Exclude empty-byte-only workloads from this ratio. Report manifest/other metadata write bytes separately from that defined amplification numerator. Use the same deterministic operation trace and initial logical state for each threshold; include maintenance latency and measure final size at the same workload boundary, without silently forcing extra maintenance on one variant. Never compare an unsynced competitor against this synchronous baseline without labeling durability differences.
 
-Results start as pending. Each optimization must include a hypothesis, measurement, and explanation of its cost, including disappointing results.
+Counters and the exact protocol are defined in docs/m4-design.md sections 4 and 5; measured results are in bench/results/summary.md. Each optimization must include a hypothesis, measurement, and explanation of its cost, including disappointing results.
 
 References:
 - LevelDB implementation: https://github.com/google/leveldb/blob/main/doc/impl.md
