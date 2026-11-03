@@ -98,6 +98,7 @@ struct DbWorkload {
     std::uint64_t min_compactions = 0;
     SstLimits limits;  // lowered to force multi-SST compaction output
     std::size_t value_pad = 0;  // bytes appended to every Put value
+    bool alternate_filters = false;  // filters off on every other open
     std::uint32_t min_max_base_run = 0;  // required largest base run seen
 };
 
@@ -388,6 +389,11 @@ void DifferentialTest::RunDb(const std::string& workload,
         trace.Add("REOPEN after op " + std::to_string(index));
         ++reopens;
         db.reset();
+        if (w.alternate_filters) {
+            // Odd opens write filterless version 1 SSTs.
+            internal.bloom_bits_per_key =
+                reopens % 2 == 1 ? 0 : kDefaultBloomBitsPerKey;
+        }
         const Status s = DBOpener::Open(dir, options, internal, sys, db);
         if (!s.ok()) {
             return trace.Fail(index, "reopen failed: " + s.ToString());
@@ -481,6 +487,22 @@ void DifferentialTest::RunDb(const std::string& workload,
     }
     note_base_run();
     EXPECT_GE(max_base_run, w.min_max_base_run);
+    // SST versions among the live files: 1 (no filter) and 2 (filter).
+    std::uint64_t versions[3] = {0, 0, 0};
+    for (const auto& sst : manifest.ssts) {
+        std::string bytes;
+        ASSERT_TRUE(test::ReadBytes(dir / test::RawSstName(sst.file_id),
+                                    bytes));
+        const std::uint64_t v = test::ReadLE(bytes, bytes.size() - 12, 4);
+        ASSERT_TRUE(v == 1 || v == 2) << v;
+        ++versions[v];
+    }
+    if (w.alternate_filters) {
+        EXPECT_GT(versions[1], 0u);
+        EXPECT_GT(versions[2], 0u);
+    }
+    RecordProperty("live_v1_ssts", std::to_string(versions[1]));
+    RecordProperty("live_v2_ssts", std::to_string(versions[2]));
     EXPECT_GE(flushes, w.min_flushes) << "workload=" << workload
                                       << " seed=" << Seed();
     EXPECT_GE(compactions, w.min_compactions) << "workload=" << workload
@@ -534,6 +556,14 @@ TEST_P(DifferentialTest, DbCompactionPeriodicReopen) {
     w.min_flushes = MinFlushesPerSeed();
     w.min_compactions = MinCompactionsPerSeed();
     RunDb("DbCompactionPeriodicReopen", w);
+}
+
+// Filters alternate between opens with compaction disabled, so filterless
+// version 1 and filter-bearing version 2 SSTs are live together.
+TEST_P(DifferentialTest, DbMixedFilterPeriodicReopen) {
+    DbWorkload w = FlushWorkload(ReopenEvery());
+    w.alternate_filters = true;
+    RunDb("DbMixedFilterPeriodicReopen", w);
 }
 
 // The same with at most three blocks per output SST and every Put value

@@ -283,6 +283,9 @@ struct DB::Impl {
     std::size_t compaction_trigger = 0;
     SstLimits sst_limits;
     std::uint32_t max_manifest_ssts = kMaxManifestSsts;
+    std::uint32_t bloom_bits_per_key = kDefaultBloomBitsPerKey;
+    bool bypass_bloom_queries = false;
+    DbStats stats;
 
     std::unique_ptr<WritableFile> wal;
     Memtable memtable;
@@ -352,6 +355,7 @@ Status DB::Impl::Initialize() {
     manifest = std::move(initial);
     next_file_id = manifest.next_file_id;
     last_sequence = 0;
+    stats.metadata_bytes += header.size() + bytes.size();
     return Status::Ok();
 }
 
@@ -535,6 +539,10 @@ Status DB::Impl::Write(ValueType type,
         }
         memtable.Apply(sequence, type, key, value);
         last_sequence = sequence;
+        ++stats.mutations;
+        stats.user_bytes +=
+            key.size() + (type == ValueType::kPut ? value.size() : 0);
+        stats.wal_bytes += record.size();
         syscalls->Checkpoint("write.applied");
     } catch (...) {
         needs_recovery = true;
@@ -619,6 +627,9 @@ Status DB::Impl::PublishFlush() {
     if (!s.ok()) {
         return s;
     }
+    ++stats.flushes;
+    stats.flush_sst_bytes += meta.file_size;
+    stats.metadata_bytes += header.size();
 
     // F6: the new generation is durable. None of these steps allocates.
     const std::uint64_t old_wal_id = manifest.active_wal_id;
@@ -657,6 +668,9 @@ Status DB::Impl::PublishManifest(const Manifest& next) {
                            dir / kManifestFileName, bytes, *syscalls);
     if (s.ok()) {
         s = SyncDirectory(dir, *syscalls);
+    }
+    if (s.ok()) {
+        stats.metadata_bytes += bytes.size();
     }
     return s;
 }
@@ -771,7 +785,8 @@ Status DB::Impl::PublishCompaction() {
                 if (!s.ok()) {
                     return s;
                 }
-                builder = std::make_unique<SstBuilder>(*file, sst_limits);
+                builder = std::make_unique<SstBuilder>(*file, sst_limits,
+                                                       bloom_bits_per_key);
             }
             s = builder->Add(e.key, e.sequence, e.type, e.value);
             if (!s.ok()) {
@@ -812,6 +827,11 @@ Status DB::Impl::PublishCompaction() {
     if (!s.ok()) {
         return s;
     }
+    ++stats.compactions;
+    stats.compaction_outputs += next.ssts.size();
+    for (const ManifestSst& output : next.ssts) {
+        stats.compaction_sst_bytes += output.file_size;
+    }
 
     // C5: the new generation is durable. None of these steps allocates.
     for (Orphan& input : retired) {
@@ -837,7 +857,7 @@ Status DB::Impl::WriteSst(std::uint64_t id,
     if (!s.ok()) {
         return s;
     }
-    SstBuilder builder(*file, sst_limits);
+    SstBuilder builder(*file, sst_limits, bloom_bits_per_key);
     s = BuildSstFromMemtable(memtable, builder);
     if (s.ok()) {
         s = file->Sync();
@@ -976,6 +996,9 @@ Status DBOpener::Open(const std::filesystem::path& directory,
     impl->memtable_bytes = options.memtable_bytes;
     impl->compaction_trigger = internal.compaction_trigger;
     impl->max_manifest_ssts = max_manifest_ssts;
+    impl->bloom_bits_per_key =
+        std::min(internal.bloom_bits_per_key, kMaxFilterBitsPerKey);
+    impl->bypass_bloom_queries = internal.bypass_bloom_queries;
     impl->sst_limits = internal.sst_limits;
     s = LockFile(dir / kLockFileName, impl->lock, syscalls);
     if (!s.ok()) {
@@ -1032,13 +1055,30 @@ Status DB::Get(std::string_view key, std::string& out_value) const {
     std::string value;
     LookupResult result = impl_->memtable.Lookup(key, &value);
     const auto& tables = impl_->tables;
+    DbStats& stats = impl_->stats;
+    ++stats.gets;
+    SstReadStats read;
+    const bool use_filter = !impl_->bypass_bloom_queries;
+    // Folds this lookup's SST counters into the handle's, on every return.
+    struct Fold {
+        DbStats& stats;
+        const SstReadStats& read;
+        ~Fold() {
+            stats.range_rejections += read.range_rejections;
+            stats.filter_rejections += read.filter_rejections;
+            stats.data_block_reads += read.block_reads;
+            stats.data_block_bytes += read.block_bytes;
+        }
+    } fold{stats, read};
     const std::size_t base = impl_->manifest.base_run_count;
     // Flush runs, newest first; then the base run, which is older than all
     // of them and holds each key in at most one SST. A read error changes
     // nothing durable, so the handle stays usable.
     for (std::size_t i = tables.size();
          result == LookupResult::kAbsent && i > base; --i) {
-        const Status s = tables[i - 1]->Get(key, result, &value);
+        ++impl_->stats.candidate_ssts;
+        const Status s = tables[i - 1]->Get(key, result, &value, &read,
+                                            use_filter);
         if (!s.ok()) {
             out_value.clear();
             return s;
@@ -1052,7 +1092,9 @@ Status DB::Get(std::string_view key, std::string& out_value) const {
                 return BytewiseLess{}(t->summary().largest_key(), k);
             });
         if (it != end) {
-            const Status s = (*it)->Get(key, result, &value);
+            ++impl_->stats.candidate_ssts;
+            const Status s = (*it)->Get(key, result, &value, &read,
+                                        use_filter);
             if (!s.ok()) {
                 out_value.clear();
                 return s;
@@ -1065,6 +1107,22 @@ Status DB::Get(std::string_view key, std::string& out_value) const {
     }
     out_value = std::move(value);
     return Status::Ok();
+}
+
+DbStats DBOpener::Stats(const DB& db) {
+    return db.impl_->stats;
+}
+
+void DBOpener::ResetStats(DB& db) {
+    db.impl_->stats = DbStats{};
+}
+
+std::size_t DBOpener::LiveRuns(const DB& db) {
+    return RunCount(db.impl_->manifest);
+}
+
+std::size_t DBOpener::LiveSsts(const DB& db) {
+    return db.impl_->manifest.ssts.size();
 }
 
 }  // namespace kv
