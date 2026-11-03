@@ -1,16 +1,15 @@
-# Failure Matrix (M1-M3)
+# Failure Matrix (M1-M4)
 
 Evidence: one fresh Debug ASan/UBSan acceptance run of the whole suite
-on the M3 code before it was committed: base `c6a410f` plus the M3
-working-tree changes (manifest version 2, multi-SST base runs, run-count
-trigger). Test data was on ext4. Result: 493/493 passing, none skipped or
+on the M4 code before it was committed: the M3 code plus the M4 changes,
+with test data on ext4. Result: 534/534 passing, none skipped or
 disabled, no sanitizer report. Every count below comes from that run.
-The committed code is that code with two comments corrected (`DB::Get`
-in src/core/db.cc, and src/core/manifest.cc); the documentation was
-edited after the run.
-
-Earlier runs are historical and do not describe this tree: 457/457
-before the correction passes, and targeted runs during development.
+The committed code is that code with three comments corrected
+(`DB::Get` in src/core/db.cc, src/core/manifest.cc, and `wal_bytes` in
+src/core/db_internal.h); the documentation was edited after the run.
+The earlier runs (457/457 and 493/493 for M3, 531/531 for M4 before the
+pre-commit review added three tests) are historical and describe earlier
+trees.
 
 Each row names the regression test that checks it.
 
@@ -54,7 +53,7 @@ power-loss behavior. Injected errors never model a lost page cache.
 | Compaction input unlink | errno | publication kept, handle usable, garbage removed by the next publication; referenced output never removed | pass | `CompactionFaultTest.InputUnlinkFailureLeavesGarbageButKeepsHandle` |
 | Compaction ordering | trace | inputs read, output synced and named durably, manifest published, then inputs removed | pass | `CompactionFaultTest.CompactionOrderSyncsOutputBeforePublication` |
 | Compaction input corruption | bytes | Corruption, NeedsRecovery, no output published | pass | `CompactionFaultTest.CorruptInputFailsCompactionAndOpen` |
-| Merge: two versions of one key with one sequence, shadowed by a newer version, every input order | crafted SSTs | Corruption from Open and from Next | pass (targeted; failed for 4 of 6 orders before the fix) | `CompactionInputTest.MergeRejectsDuplicateSequencesBehindANewerVersion` |
+| Merge: two versions of one key with one sequence, shadowed by a newer version, every input order | crafted SSTs | Corruption from Open and from Next | pass (failed for 4 of 6 orders before the fix, B-007) | `CompactionInputTest.MergeRejectsDuplicateSequencesBehindANewerVersion` |
 | Crash oracle: wrong empty-key state; initialization outcome table | crafted states and results | each wrong state or outcome is reported as a violation | pass (the empty-key case failed before the oracle fix) | `CrashOracleTest.*` (3) |
 | Compaction output split (lowered limits) | crafted workload | outputs split exactly at the block limit, key-ordered and key-disjoint, with overlapping sequence intervals allowed; one base run | pass | `DBM3Test.CompactionSplitsOutputAtExactBoundariesIntoOneBaseRun` |
 | Maximum legal entry, empty and binary keys across outputs; delete everything | crafted workload | the maximum entry gets its own output; all lookups correct; full deletion leaves no SST and keeps the checkpoint; writes continue after reopen | pass | `DBM3Test.MaximumEntryAndEmptyKeysSplitAndDeleteCleanly` |
@@ -67,6 +66,19 @@ power-loss behavior. Injected errors never model a lost page cache.
 | M2 database (manifest version 1) opened by M3 | genuine fixture written by the v0.2-m2 build | UnsupportedFormat with no write, truncate, sync, rename, or unlink; every name and byte unchanged | pass | `DBM3Test.M2DatabaseIsUnsupportedAndLeftUnchanged` |
 | Manifest versions written by M3 | inspection | version 2 for new, single-SST, compacted, and emptied databases | pass | `DBM3Test.M3AlwaysWritesManifestVersion2` |
 | Unknown manifest versions | bytes | versions 0, 1, 3, and 2^32-1 are UnsupportedFormat | pass | `Manifest.UnknownVersionIsUnsupportedFormat` |
+| Filter hash and encoding (M4) | independent golden vectors | KVHASH1 values and complete filter bytes equal scripts/bloom_reference.py; the version 2 SST golden too | pass | `Bloom.Kvhash1MatchesIndependentVectors`, `Bloom.EncodingMatchesIndependentFilterBytes`, `SstTest.ProductionAndTestBuildersMatchGoldenBytes` |
+| No false negatives (M4) | generated keys | every added key, including empty, binary, and 300-byte keys, is reported present after reload, at 1, 2, 10, and 64 bits per key | pass | `Bloom.NoFalseNegativesAfterReload` |
+| False-positive rate (M4) | 10,000 keys, 100,000 disjoint probes | at most 1.5 p + 0.2% for p from the actual m, n, k; observed 9.13% at 5 bits/key, 0.891% at 10, 0.048% at 16 | pass | `Bloom.FalsePositiveRateMatchesTheParameters` |
+| Malformed filters with valid CRCs (M4) | bytes | unknown filter or hash version: UnsupportedFormat; key count 0, above the data region or the limit, or different from the entries; probes 0 or 31; too many or too few bit bytes; a filter that denies a stored key: Corruption | pass | `BloomSstTest.MalformedFiltersWithValidChecksumsFailOpen` |
+| Filter bit flips and truncations (M4) | bytes | every flip in the filter block and every truncation of a version 2 SST fails Open | pass | `BloomSstTest.EveryFilterBitFlipAndTruncationFailsClosed` |
+| Version 2 footer regions (M4) | bytes | filter length 0, 27, above the limit, or 2^64-1; overflowing or inconsistent offsets; a version 1 footer with a filter: Corruption | pass | `BloomSstTest.FooterFilterRegionsAreBoundedWithoutOverflow` |
+| Filter size bounded before allocation (M4) | sparse file | a footer claiming the largest legal filter after a 25-byte data region is rejected after reading 48 + 16 bytes | pass | `BloomSstTest.ImpossibleFilterSizeIsRejectedBeforeTheBitArrayIsRead` |
+| Filterless and filter-bearing SSTs together (M4) | engine and hand-built files | version 1 and version 2 SSTs in one manifest version 2 database answer correctly with filters used or bypassed; compaction rewrites as version 2 | pass | `DBM4Test.FilterlessAndFilterBearingSstsCoexist`, `DBM4Test.IndependentlyBuiltVersion1SstOpensBesideVersion2` |
+| Tombstone masking through filters (M4) | Put, flush, Delete, flush, compaction disabled | the tombstone SST's filter holds the key; NotFound with filters used or bypassed, before and after reopen | pass | `DBM4Test.FlushedTombstoneMasksOlderValueThroughFilters` |
+| Filters on multi-output compaction (M4) | lowered limits | every output is version 2 with a filter of exactly its keys, revalidated at reopen | pass | `DBM4Test.MultiOutputCompactionWritesAFilterPerOutput` |
+| Filter key limit in compaction (M4) | lowered limits | compaction rolls over to a new output before the key limit; every output's filter holds at most the limit; data intact after reopen | pass | `DBM4Test.CompactionRollsOverAtTheFilterKeyLimit` |
+| Filter key limit in flush (M4) | lowered limits | a flush with more keys than the limit fails with InvalidArgument; NeedsRecovery; no SST published; no data lost after reopen | pass | `DBM4Test.FlushOverTheFilterKeyLimitFailsClosed` |
+| Filterless output and the key limit (M4) | bits per key 0 | version 1 output is not subject to the filter key limit | pass | `DBM4Test.FilterlessOutputIgnoresTheFilterKeyLimit` |
 | SST writer limit in flush or compaction | lowered limits | InvalidArgument, NeedsRecovery, no data lost; repeats after reopen (capacity issue, docs/m3-design.md section 5) | pass | `DBM3Test.FlushOverTheSstLimitFailsClosedAndRepeats`, `DBM3Test.OutputOverTheSstLimitFailsClosedAndRepeats` |
 | Counter exhaustion before compaction | crafted manifest | InvalidArgument without I/O; handle usable | pass | `DBM3Test.CompactionCounterExhaustionRejectsWithoutIo` |
 
@@ -86,12 +98,12 @@ returned is judged by the directory table (docs/sst-format.md section
 |---|---|---:|---:|---|---|---|
 | Init | mkdir, parent sync, WAL and manifest initialization, first writes | 28 | 56 | init-fresh 3 / 7; init-published 2 / 1; init-residue 8 / 5; acknowledged 3 / 6; with in-flight 12 / 9 | pass | `Workloads/CrashMatrixTest.EveryCrashPointRecoversUnderBothModels/Init` |
 | WalAppend | puts, overwrite, delete, empty value | 21 | 42 | acknowledged 5 / 9; with in-flight 16 / 12 | pass | `.../WalAppend` |
-| Flush | three flushes (SST and WAL publication, manifest, cleanup) | 73 | 146 | acknowledged 61 / 64; with in-flight 12 / 9 | pass | `.../Flush` |
-| Compaction | five flush+compaction rounds, ending with an empty output and a new write | 194 | 388 | acknowledged 174 / 179; with in-flight 20 / 15 | pass | `.../Compaction` |
-| TailRepair | torn tail truncate and sync, Open-time directory sync, orphan and stale MANIFEST.tmp removal, appends | 53 | 106 | acknowledged 45 / 47; with in-flight 8 / 6 | pass | `.../TailRepair` |
-| EmptyKey | the empty key through overwrite, delete, empty value, flush, and compaction (trigger 2) | 185 | 370 | acknowledged 165 / 170; with in-flight 20 / 15 | pass | `.../EmptyKey` |
-| MultiOutput | one block per output: compaction into a multi-SST base run (every output's sync and rename, one directory sync, one manifest), flushes above it, empty key, delete, overwrite | 202 | 404 | acknowledged 186 / 190; with in-flight 16 / 12 | pass | `.../MultiOutput` |
-| Total | | 756 | 1512 | | pass | |
+| Flush | three flushes (SST with filter, WAL publication, manifest, cleanup) | 76 | 152 | acknowledged 64 / 67; with in-flight 12 / 9 | pass | `.../Flush` |
+| Compaction | five flush+compaction rounds, ending with an empty output and a new write | 203 | 406 | acknowledged 183 / 188; with in-flight 20 / 15 | pass | `.../Compaction` |
+| TailRepair | torn tail truncate and sync, Open-time directory sync, orphan and stale MANIFEST.tmp removal, appends | 55 | 110 | acknowledged 47 / 49; with in-flight 8 / 6 | pass | `.../TailRepair` |
+| EmptyKey | the empty key through overwrite, delete, empty value, flush, and compaction (trigger 2) | 194 | 388 | acknowledged 174 / 179; with in-flight 20 / 15 | pass | `.../EmptyKey` |
+| MultiOutput | one block per output: compaction into a multi-SST base run (every output's sync and rename, one directory sync, one manifest), flushes above it, empty key, delete, overwrite | 216 | 432 | acknowledged 200 / 204; with in-flight 16 / 12 | pass | `.../MultiOutput` |
+| Total | | 793 | 1586 | | pass | |
 
 Crash points are completed state-changing calls (open that creates or
 truncates, write, ftruncate, fsync, rename, unlink, mkdir) and the named
@@ -104,9 +116,9 @@ each workload's enumeration.
 
 | Variant | Model | Expected | Observed | Test |
 |---|---|---|---|---|
-| Normal control: Flush (73 points), MultiOutput (202 points) | both | no violation | 0 and 0 | `Workloads/CrashMutationTest.SkippedSstContentSyncIsCaughtOnlyUnderUnsyncedLoss/{Flush,MultiOutput}` |
+| Normal control: Flush (76 points), MultiOutput (216 points) | both | no violation | 0 and 0 | `Workloads/CrashMutationTest.SkippedSstContentSyncIsCaughtOnlyUnderUnsyncedLoss/{Flush,MultiOutput}` |
 | SST content fsync skipped (`.sst.tmp`) | process | no violation (completed writes survive) | 0 and 0 | same |
-| SST content fsync skipped | unsynced-loss | violations once a manifest naming the SST is durable; for MultiOutput, also on a compaction output | Flush: 57, the first at point 17, `sst-000002.sst: size 0 differs from the expected 100`. MultiOutput: 186, the first at point 17 (a flushed SST, `sst-000004.sst`); the test also requires a violation that names the compaction output `sst-000006.sst` | same |
+| SST content fsync skipped | unsynced-loss | violations once a manifest naming the SST is durable; for MultiOutput, also on a compaction output | Flush: 59, the first at point 18 (the manifest's directory fsync), `sst-000002.sst: size 0 differs from the expected 128`. MultiOutput: 199, the first at point 18 (a flushed SST, `sst-000004.sst`); the test also requires a violation that names the compaction output `sst-000006.sst` | same |
 
 This is a planted mutation that checks the harness; it is not a defect
 found in the engine.
@@ -114,13 +126,15 @@ found in the engine.
 ## 4. Differential workloads
 
 All seeds 1-20 at 5000 operations, with a reopen every 500 operations
-where periodic. All `db_dir` paths were on ext4.
+where periodic. All `db_dir` paths were on ext4. Filters are on (10 bits
+per key) in every DB workload except where stated.
 
 | Workload | Opens | Flushes per seed | Compactions per seed | Largest base run | Observed | Test |
 |---|---:|---:|---:|---:|---|---|
 | Memtable | - | - | - | - | pass | `Seeds/DifferentialTest.Memtable/*` |
 | DbWithoutReopen / DbPeriodicReopen (4 MiB memtable) | 1 / 11 | 0 | 0 | 0 | pass | `.../DbWithoutReopen/*`, `.../DbPeriodicReopen/*` |
 | DbFlushWithoutReopen / DbFlushPeriodicReopen (4 KiB, compaction off) | 1 / 11 | 35-50 | 0 | 0 | pass | `.../DbFlush*/*` |
+| DbMixedFilterPeriodicReopen (as DbFlushPeriodicReopen, filters off on every other open) | 11 | 35-50 | 0 | 0; live SSTs at the end: 14-27 version 1 and 15-26 version 2 per seed | pass | `.../DbMixedFilterPeriodicReopen/*` |
 | DbCompactionPeriodicReopen (4 KiB, trigger 2) | 11 | 35-50 | 34-49 | 1 | pass | `.../DbCompactionPeriodicReopen/*` |
 | DbMultiOutputCompactionPeriodicReopen (4 KiB, trigger 2, at most 3 blocks per SST, values padded by 600 bytes) | 11 | 333-356 | 332-355 | 2-3 | pass | `.../DbMultiOutputCompactionPeriodicReopen/*` |
 
@@ -151,3 +165,9 @@ flush, including across reopens. WAL truncation cuts: 206.
 - Compaction with a very large number of inputs (descriptor and memory
   use grow with the input count).
 - Concurrency (the engine is single-threaded by contract).
+- The filter key limit (2^22 keys per SST) at its real size, and filter
+  memory at scale; the limit is tested with a lowered builder limit.
+- False-positive rates for key distributions other than the generated
+  test keys.
+- Cold-cache and device-level I/O: the benchmarks count engine requests
+  with a warm page cache.
