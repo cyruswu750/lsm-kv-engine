@@ -528,8 +528,12 @@ TEST_F(DBM2Test, InterruptedInitializationResidueIsPreservedCorruption) {
 }
 
 TEST_F(DBM2Test, MalformedManifestIsNeverTreatedAsANewDatabase) {
-    RawManifest v2;
-    v2.version = 2;
+    // Manifest version 2 is current (M3). Version 1 (the M2 format) and
+    // unknown versions are UnsupportedFormat (docs/sst-format.md 4.3).
+    RawManifest v1;
+    v1.version = 1;
+    RawManifest v3;
+    v3.version = 3;
     std::string bad_crc = ManifestBytes(RawManifest{});
     bad_crc.back() ^= 1;
     const struct {
@@ -543,7 +547,8 @@ TEST_F(DBM2Test, MalformedManifestIsNeverTreatedAsANewDatabase) {
         {"truncated", ManifestBytes(RawManifest{}).substr(0, 59),
          Code::Corruption},
         {"bad crc", bad_crc, Code::Corruption},
-        {"version 2", ManifestBytes(v2), Code::UnsupportedFormat},
+        {"version 1", ManifestBytes(v1), Code::UnsupportedFormat},
+        {"version 3", ManifestBytes(v3), Code::UnsupportedFormat},
     };
     for (const auto& c : cases) {
         SCOPED_TRACE(c.name);

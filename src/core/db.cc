@@ -1,6 +1,7 @@
 #include "db.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -399,6 +400,17 @@ Status DB::Impl::Recover(const DirectoryState& state) {
                 std::to_string(sst.max_sequence) + "]");
         }
         tables.push_back(std::move(table));
+    }
+    // Base SSTs must be key-ordered and key-disjoint; their key ranges come
+    // from the validated SSTs (docs/sst-format.md section 4.1).
+    for (std::size_t i = 1; i < m.base_run_count; ++i) {
+        if (!BytewiseLess{}(tables[i - 1]->summary().largest_key(),
+                            tables[i]->summary().smallest_key)) {
+            return Status::Corruption(
+                tables[i]->path() +
+                ": base run SST does not start after the previous base SST's "
+                "largest key");
+        }
     }
 
     std::uint64_t replayed = 0;
@@ -804,19 +816,39 @@ Status DB::Get(std::string_view key, std::string& out_value) const {
     }
 
     // Look up into a local first so out_value is not modified while key
-    // is still being read. The memtable holds the newest versions, and
-    // SST sequence intervals are disjoint and ordered, so searching from
-    // the newest SST and stopping at the first value or tombstone is exact.
+    // is still being read. The memtable holds the newest versions. Flush
+    // runs have disjoint, ordered sequence intervals, all newer than the
+    // base run. Base SSTs may have overlapping sequence intervals, but
+    // their key ranges are disjoint, so at most one of them holds key.
+    // Stopping at the first value or tombstone is therefore exact.
     std::string value;
     LookupResult result = impl_->memtable.Lookup(key, &value);
     const auto& tables = impl_->tables;
-    for (auto it = tables.rbegin();
-         result == LookupResult::kAbsent && it != tables.rend(); ++it) {
-        // A read error changes nothing durable, so the handle stays usable.
-        const Status s = (*it)->Get(key, result, &value);
+    const std::size_t base = impl_->manifest.base_run_count;
+    // Flush runs, newest first; then the base run, which is older than all
+    // of them and holds each key in at most one SST. A read error changes
+    // nothing durable, so the handle stays usable.
+    for (std::size_t i = tables.size();
+         result == LookupResult::kAbsent && i > base; --i) {
+        const Status s = tables[i - 1]->Get(key, result, &value);
         if (!s.ok()) {
             out_value.clear();
             return s;
+        }
+    }
+    if (result == LookupResult::kAbsent && base > 0) {
+        const auto end = tables.begin() + static_cast<std::ptrdiff_t>(base);
+        const auto it = std::lower_bound(
+            tables.begin(), end, key,
+            [](const std::unique_ptr<SstTable>& t, std::string_view k) {
+                return BytewiseLess{}(t->summary().largest_key(), k);
+            });
+        if (it != end) {
+            const Status s = (*it)->Get(key, result, &value);
+            if (!s.ok()) {
+                out_value.clear();
+                return s;
+            }
         }
     }
     if (result != LookupResult::kFound) {

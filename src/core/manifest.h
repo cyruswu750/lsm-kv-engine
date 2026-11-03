@@ -12,10 +12,11 @@
 
 namespace kv {
 
-// Manifest version 1 (docs/sst-format.md section 4).
+// Manifest version 2 (docs/sst-format.md section 4). Version 1 (M2) and
+// every other version are UnsupportedFormat; there is no migration.
 
 inline constexpr std::string_view kManifestMagic{"KVMAN001", 8};
-inline constexpr std::uint32_t kManifestVersion = 1;
+inline constexpr std::uint32_t kManifestVersion = 2;
 inline constexpr std::size_t kManifestHeaderSize = 56;
 inline constexpr std::size_t kManifestSstEntrySize = 32;
 inline constexpr std::size_t kManifestMinSize = kManifestHeaderSize + 4;
@@ -36,11 +37,22 @@ struct Manifest {
     std::uint64_t next_file_id = 0;
     std::uint64_t checkpoint = 0;
     std::uint64_t active_wal_id = 0;
-    std::vector<ManifestSst> ssts;  // oldest first
+    // The first base_run_count SSTs are the base run (key-ordered, written
+    // by the last compaction); the rest are flush runs, oldest first.
+    std::uint32_t base_run_count = 0;
+    std::vector<ManifestSst> ssts;
 };
 
-// Checks every semantic rule of section 4 (IDs, intervals, checkpoint,
-// limits). Returns Corruption naming the first violation.
+// The number of logical runs: the base run counts once.
+inline std::size_t RunCount(const Manifest& m) {
+    return (m.base_run_count > 0 ? 1 : 0) +
+           (m.ssts.size() - m.base_run_count);
+}
+
+// Checks every rule of section 4 that the manifest alone decides (IDs,
+// counts, run sequence rules, checkpoint, limits). The base run's key
+// order needs the SSTs and is checked at Open. Returns Corruption naming
+// the first violation.
 Status ValidateManifest(const Manifest& manifest);
 
 // Appends the encoding of a manifest that passes ValidateManifest.
