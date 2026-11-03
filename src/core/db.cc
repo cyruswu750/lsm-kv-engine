@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "compaction.h"
 #include "db_internal.h"
 #include "file_lock.h"
 #include "file_names.h"
@@ -279,6 +280,9 @@ struct DB::Impl {
     fs::path dir;
     PosixSyscalls* syscalls = nullptr;
     std::size_t memtable_bytes = 0;
+    std::size_t compaction_trigger = 0;
+    SstLimits sst_limits;
+    std::uint32_t max_manifest_ssts = kMaxManifestSsts;
 
     std::unique_ptr<WritableFile> wal;
     Memtable memtable;
@@ -305,7 +309,10 @@ struct DB::Impl {
     Status WriteSst(std::uint64_t id,
                     ManifestSst& meta,
                     std::unique_ptr<SstTable>& table);
-    Status RemoveObsoleteFiles(std::uint64_t old_wal_id);
+    Status Compact();
+    Status PublishCompaction();
+    Status PublishManifest(const Manifest& next);
+    Status RemoveDeferredOrphans();
 };
 
 // docs/sst-format.md section 8: WAL first, then the generation-1
@@ -505,6 +512,16 @@ Status DB::Impl::Write(ValueType type,
             return s;
         }
     }
+    // After any flush, so a flush that reaches the trigger is compacted
+    // before this mutation (docs/m3-design.md section 3).
+    // The base run counts once, so a multi-SST base is not compacted again
+    // until trigger - 1 new flushes exist (docs/m3-design.md section 3).
+    if (compaction_trigger != 0 && RunCount(manifest) >= compaction_trigger) {
+        s = Compact();
+        if (!s.ok()) {
+            return s;
+        }
+    }
 
     try {
         s = wal->Append(record);
@@ -535,7 +552,7 @@ Status DB::Impl::Flush() {
     if (next_file_id > kMaxU64 - 2) {
         return Status::InvalidArgument("file IDs are exhausted");
     }
-    if (manifest.ssts.size() >= kMaxManifestSsts) {
+    if (manifest.ssts.size() >= max_manifest_ssts) {
         return Status::InvalidArgument(
             "the manifest already lists the maximum number of SSTs");
     }
@@ -597,25 +614,8 @@ Status DB::Impl::PublishFlush() {
         return s;
     }
 
-    // F4, F5. A MANIFEST.tmp that Open failed to remove would make the
-    // exclusive create fail, so retry its removal first.
-    const auto stale = std::find_if(
-        deferred_orphans.begin(), deferred_orphans.end(),
-        [](const Orphan& o) { return o.name == kManifestTempFileName; });
-    if (stale != deferred_orphans.end()) {
-        s = RemoveFile(dir / kManifestTempFileName, *syscalls);
-        if (!s.ok()) {
-            return s;
-        }
-        deferred_orphans.erase(stale);
-    }
-    std::string bytes;
-    EncodeManifest(next, &bytes);
-    s = PublishFile(dir / kManifestTempFileName, dir / kManifestFileName,
-                    bytes, *syscalls);
-    if (s.ok()) {
-        s = SyncDirectory(dir, *syscalls);
-    }
+    // F4, F5
+    s = PublishManifest(next);
     if (!s.ok()) {
         return s;
     }
@@ -627,12 +627,202 @@ Status DB::Impl::PublishFlush() {
     manifest = std::move(next);
     tables.push_back(std::move(table));
     memtable = Memtable();
+    syscalls->Checkpoint("flush.installed");
 
     // F7. The old WAL was synced before publication, so its close result
     // does not affect durability; the descriptor is released either way.
     old_wal->Close();
     old_wal.reset();
-    return RemoveObsoleteFiles(old_wal_id);
+    deferred_orphans.push_back({WalFileName(old_wal_id), old_wal_id});
+    return RemoveDeferredOrphans();
+}
+
+// F4 and F5 (C3 and C4 for compaction). A MANIFEST.tmp that Open failed to
+// remove would make the exclusive create fail, so its removal is retried
+// first; a failure there is a publication failure.
+Status DB::Impl::PublishManifest(const Manifest& next) {
+    const auto stale = std::find_if(
+        deferred_orphans.begin(), deferred_orphans.end(),
+        [](const Orphan& o) { return o.name == kManifestTempFileName; });
+    if (stale != deferred_orphans.end()) {
+        Status s = RemoveFile(dir / kManifestTempFileName, *syscalls);
+        if (!s.ok()) {
+            return s;
+        }
+        deferred_orphans.erase(stale);
+    }
+    std::string bytes;
+    EncodeManifest(next, &bytes);
+    Status s = PublishFile(dir / kManifestTempFileName,
+                           dir / kManifestFileName, bytes, *syscalls);
+    if (s.ok()) {
+        s = SyncDirectory(dir, *syscalls);
+    }
+    return s;
+}
+
+// Counter checks need no I/O, so their failures leave the handle usable.
+// Any failure after the first compaction I/O invalidates it.
+Status DB::Impl::Compact() {
+    if (manifest.generation == kMaxU64) {
+        return Status::InvalidArgument("manifest generations are exhausted");
+    }
+    // An output needs one ID, and next_file_id must stay representable.
+    if (next_file_id > kMaxU64 - 1) {
+        return Status::InvalidArgument("file IDs are exhausted");
+    }
+
+    try {
+        Status s = PublishCompaction();
+        if (!s.ok()) {
+            needs_recovery = true;
+        }
+        return s;
+    } catch (...) {
+        needs_recovery = true;
+        throw;
+    }
+}
+
+// Steps C1-C6 of docs/m3-design.md section 4.
+Status DB::Impl::PublishCompaction() {
+    // Prepare memory for installation and cleanup before any I/O.
+    Manifest next = manifest;
+    next.generation += 1;
+    next.ssts.clear();
+    std::vector<std::unique_ptr<SstTable>> next_tables;
+    deferred_orphans.reserve(deferred_orphans.size() + tables.size());
+    // The inputs become orphans once the new manifest is durable; their
+    // names are built now so that installing them (C5) only moves them.
+    std::vector<Orphan> retired;
+    retired.reserve(manifest.ssts.size());
+    for (const ManifestSst& input : manifest.ssts) {
+        retired.push_back({SstFileName(input.file_id), input.file_id});
+    }
+    std::vector<const SstTable*> inputs;
+    inputs.reserve(tables.size());
+    for (const auto& table : tables) {
+        inputs.push_back(table.get());
+    }
+
+    // C1. Every live SST is an input and every newer version is in the
+    // memtable or WAL, so a winning tombstone shadows nothing that could
+    // resurface: it is dropped together with its key.
+    std::unique_ptr<MergingIterator> merge;
+    Status s = MergingIterator::Open(inputs, merge);
+    if (!s.ok()) {
+        return s;
+    }
+    // Outputs are split before either SST limit would be exceeded, so they
+    // are key-ordered and key-disjoint. Their count leaves room in the
+    // manifest for the flushes that lead to the next compaction.
+    const std::size_t max_outputs =
+        max_manifest_ssts - (compaction_trigger - 1);
+    std::uint64_t out_id = 0;
+    std::unique_ptr<WritableFile> file;
+    std::unique_ptr<SstBuilder> builder;
+    auto finish_output = [&]() -> Status {
+        const std::string name = SstFileName(out_id);
+        Status r = builder->Finish();
+        if (r.ok()) {
+            r = file->Sync();
+        }
+        if (r.ok()) {
+            r = file->Close();
+        }
+        if (r.ok()) {
+            r = RenameFile(dir / TempFileName(name), dir / name, *syscalls);
+        }
+        if (!r.ok()) {
+            return r;
+        }
+        SstSummary& summary = builder->summary();
+        next.ssts.push_back({out_id, summary.file_size, summary.min_sequence,
+                             summary.max_sequence});
+        next_tables.push_back(std::make_unique<SstTable>(
+            (dir / name).string(), *syscalls, std::move(summary)));
+        builder.reset();
+        file.reset();
+        return Status::Ok();
+    };
+    while (merge->Valid()) {
+        const SstEntry& e = merge->entry();
+        if (e.type == ValueType::kPut) {
+            if (builder && !builder->CanAdd(e.key, e.value)) {
+                s = finish_output();
+                if (!s.ok()) {
+                    return s;
+                }
+            }
+            if (!builder) {
+                if (next.ssts.size() >= max_outputs) {
+                    return Status::InvalidArgument(
+                        "compaction output needs more than " +
+                        std::to_string(max_outputs) + " SSTs");
+                }
+                if (next_file_id > kMaxU64 - 1) {
+                    return Status::InvalidArgument("file IDs are exhausted");
+                }
+                // Never reused, even if this compaction fails.
+                out_id = next_file_id;
+                next_file_id = out_id + 1;
+                s = NewWritableFile(dir / TempFileName(SstFileName(out_id)),
+                                    file, *syscalls);
+                if (!s.ok()) {
+                    return s;
+                }
+                builder = std::make_unique<SstBuilder>(*file, sst_limits);
+            }
+            s = builder->Add(e.key, e.sequence, e.type, e.value);
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        s = merge->Next();
+        if (!s.ok()) {
+            return s;
+        }
+    }
+    s = merge->Close();
+    // The merge refers to the input tables, which installation releases.
+    merge.reset();
+    if (!s.ok()) {
+        return s;
+    }
+    if (builder) {
+        s = finish_output();
+        if (!s.ok()) {
+            return s;
+        }
+    }
+    // C2: every output's contents were synced above; one directory sync
+    // makes all their names durable before a manifest names them.
+    if (!next.ssts.empty()) {
+        s = SyncDirectory(dir, *syscalls);
+        if (!s.ok()) {
+            return s;
+        }
+    }
+    next.base_run_count = static_cast<std::uint32_t>(next.ssts.size());
+    // Covers the outputs and any high-ID orphan seen at Open (D-013).
+    next.next_file_id = next_file_id;
+
+    // C3, C4
+    s = PublishManifest(next);
+    if (!s.ok()) {
+        return s;
+    }
+
+    // C5: the new generation is durable. None of these steps allocates.
+    for (Orphan& input : retired) {
+        deferred_orphans.push_back(std::move(input));
+    }
+    manifest = std::move(next);
+    tables.swap(next_tables);
+    syscalls->Checkpoint("compaction.installed");
+
+    // C6. The inputs are no longer referenced by the durable manifest.
+    return RemoveDeferredOrphans();
 }
 
 Status DB::Impl::WriteSst(std::uint64_t id,
@@ -647,7 +837,7 @@ Status DB::Impl::WriteSst(std::uint64_t id,
     if (!s.ok()) {
         return s;
     }
-    SstBuilder builder(*file);
+    SstBuilder builder(*file, sst_limits);
     s = BuildSstFromMemtable(memtable, builder);
     if (s.ok()) {
         s = file->Sync();
@@ -672,12 +862,11 @@ Status DB::Impl::WriteSst(std::uint64_t id,
     return Status::Ok();
 }
 
-// Unlink failures leave garbage for a later attempt and are not errors.
-// A failed directory sync is reported and invalidates the handle; it is
-// not retried (design.md section 8).
-Status DB::Impl::RemoveObsoleteFiles(std::uint64_t old_wal_id) {
-    deferred_orphans.push_back({WalFileName(old_wal_id), old_wal_id});
-
+// Removes every deferred orphan below the durable next_file_id. Unlink
+// failures leave garbage for a later attempt and are not errors. A failed
+// directory sync is reported and invalidates the handle; it is not retried
+// (design.md section 8).
+Status DB::Impl::RemoveDeferredOrphans() {
     std::vector<Orphan> kept;
     bool removed = false;
     for (Orphan& orphan : deferred_orphans) {
@@ -713,11 +902,27 @@ Status DBOpener::Open(const std::filesystem::path& directory,
                       const Options& options,
                       PosixSyscalls& syscalls,
                       std::unique_ptr<DB>& out) {
+    return Open(directory, options, InternalOptions{}, syscalls, out);
+}
+
+Status DBOpener::Open(const std::filesystem::path& directory,
+                      const Options& options,
+                      const InternalOptions& internal,
+                      PosixSyscalls& syscalls,
+                      std::unique_ptr<DB>& out) {
     if (out) {
         return Status::InvalidArgument("Open requires an empty output pointer");
     }
     if (options.memtable_bytes == 0) {
         return Status::InvalidArgument("memtable_bytes must be positive");
+    }
+    const std::uint32_t max_manifest_ssts =
+        std::min(internal.max_manifest_ssts, kMaxManifestSsts);
+    if (internal.compaction_trigger == 1 ||
+        internal.compaction_trigger > max_manifest_ssts) {
+        return Status::InvalidArgument(
+            "compaction_trigger must be 0 (disabled) or at least 2, and at "
+            "most the manifest SST limit");
     }
     Status s = CheckSyscallPath(directory, "open database");
     if (!s.ok()) {
@@ -769,6 +974,9 @@ Status DBOpener::Open(const std::filesystem::path& directory,
     impl->dir = dir;
     impl->syscalls = &syscalls;
     impl->memtable_bytes = options.memtable_bytes;
+    impl->compaction_trigger = internal.compaction_trigger;
+    impl->max_manifest_ssts = max_manifest_ssts;
+    impl->sst_limits = internal.sst_limits;
     s = LockFile(dir / kLockFileName, impl->lock, syscalls);
     if (!s.ok()) {
         return s;
