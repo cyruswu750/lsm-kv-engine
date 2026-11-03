@@ -15,7 +15,8 @@ add_executable(kv_tests
   sst_test.cpp
   manifest_test.cpp
   db_m2_test.cpp
-  db_publish_fault_test.cpp)
+  db_publish_fault_test.cpp
+  crash_sim_test.cpp)
 target_link_libraries(kv_tests PRIVATE kv GTest::gtest_main)
 
 include(GoogleTest)
