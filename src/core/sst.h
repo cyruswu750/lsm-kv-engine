@@ -41,6 +41,15 @@ inline constexpr std::uint64_t kMinSstFileSize =
 inline constexpr std::uint32_t kMaxSstBlocks = 1u << 20;
 inline constexpr std::uint64_t kMaxSstIndexSize = 64u << 20;
 
+// One entry of a validated block. The views point into a block buffer
+// owned by whoever parsed it.
+struct SstEntry {
+    std::string_view key;
+    std::uint64_t sequence = 0;
+    ValueType type = ValueType::kPut;
+    std::string_view value;
+};
+
 struct SstBlockHandle {
     std::string last_key;
     std::uint64_t offset = 0;
@@ -54,6 +63,11 @@ struct SstSummary {
     std::uint64_t max_sequence = 0;
     std::string smallest_key;
     std::vector<SstBlockHandle> index;
+
+    // The last key of the last block. A valid SST has at least one block.
+    const std::string& largest_key() const {
+        return index.back().last_key;
+    }
 };
 
 // Writer limits. Production uses the format limits; tests lower them to
@@ -83,6 +97,12 @@ public:
                std::uint64_t sequence,
                ValueType type,
                std::string_view value);
+
+    // True if Add(key, value) followed by Finish would stay within the
+    // limits, so a caller can start a new SST instead. Ignores the other
+    // Add rules (order, lengths). An empty builder accepts any legal entry
+    // under the format limits.
+    bool CanAdd(std::string_view key, std::string_view value) const;
 
     // Writes the final block, the index, and the footer. An SST must hold
     // at least one entry (InvalidArgument otherwise). A block that would
@@ -138,6 +158,10 @@ public:
         return summary_;
     }
 
+    const std::string& path() const {
+        return path_;
+    }
+
     // Probes the one block that may hold key and validates it again. On
     // kFound, *value receives the value; otherwise it is unchanged.
     Status Get(std::string_view key,
@@ -145,9 +169,56 @@ public:
                std::string* value) const;
 
 private:
+    friend class SstIterator;
+
     std::string path_;
     PosixSyscalls* syscalls_;
     SstSummary summary_;
+};
+
+// Streams every entry of a validated SST in key order, reading and
+// validating one block at a time exactly as SstTable::Open does
+// (docs/sst-format.md section 3.4, step 4). Memory is one block. The
+// iterator holds one read-only descriptor until Close or destruction; the
+// table must outlive it. After any error the iterator is no longer Valid.
+class SstIterator {
+public:
+    SstIterator(const SstIterator&) = delete;
+    SstIterator& operator=(const SstIterator&) = delete;
+
+    // Opens the table's file and positions at its first entry. out must
+    // be empty; on failure it stays empty.
+    static Status Open(const SstTable& table,
+                       std::unique_ptr<SstIterator>& out);
+
+    bool Valid() const {
+        return position_ < entries_.size();
+    }
+
+    // Requires Valid(). The views stay valid until the next Next or Close.
+    const SstEntry& entry() const {
+        return entries_[position_];
+    }
+
+    // Requires Valid(). Moves to the next entry, reading the next block
+    // when needed. A read error (IOError) or a block failing validation
+    // (Corruption) is returned, and the iterator stops.
+    Status Next();
+
+    // Releases the descriptor; later calls return Ok.
+    Status Close();
+
+private:
+    explicit SstIterator(const SstTable& table) : table_(&table) {}
+
+    Status LoadBlock(std::size_t i);
+
+    const SstTable* table_;
+    std::unique_ptr<RandomAccessFile> file_;
+    std::string buffer_;
+    std::vector<SstEntry> entries_;
+    std::size_t position_ = 0;
+    std::size_t block_ = 0;
 };
 
 }  // namespace kv
