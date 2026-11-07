@@ -1,3 +1,4 @@
+# Local working notes and build directories (not part of the project)
 CLAUDE.md
 build/
 /build-acceptance/
