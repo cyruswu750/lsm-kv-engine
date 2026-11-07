@@ -1,169 +1,119 @@
 # Bug Log
 
-Record significant bugs found during development, especially those
-affecting correctness, recovery, or data integrity.
+Defects found during development that affected correctness, recovery, or data integrity. Each entry
+uses the same fields: symptom, impact, root cause, how it was found, the fix, and the regression tests
+that now catch it. Test names use the current suite names. Commit IDs are on `main`.
 
-## B-001: DecodeFixed32/64 mis-decode bytes >= 0x80
-
-- Symptom: DecodeFixed32("\x80\x00\x00\x00") returned 0xFFFFFF80 instead of 0x80;
-  DecodeFixed64 aborted under UBSan ("shift exponent 32 is too large for 32-bit type 'int'").
-- Found by: Coding golden-byte/round-trip tests (32-bit); UBSan (64-bit).
-- Root cause: 32-bit cast signed `char` directly to uint32_t (sign extension);
-  64-bit shifted as `int` before widening (UB for shifts >= 32).
-- Fix: char -> unsigned char -> uintN_t, then shift. Commit 0bfc9cb.
-- Regression test: Coding.DecodeFixed32FromSpecifiedBytes, Coding.DecodeFixed64FromSpecifiedBytes.
-
-## B-002: DecodeWalRecord reports invalid tail records as Incomplete
-
-- Symptom: A record with a valid header CRC but an invalid field (key/value length
-  over limit, Delete with value_len != 0, bad sequence) and a truncated payload
-  decoded as Incomplete instead of Corruption.
-- Found by: WalRecordMalformedTest.OversizedLengths,
-  WalRecordMalformedTest.InvalidFieldsWithMissingPayloadAreCorruption.
-- Root cause: The "remaining < total" check ran before field validation, so a
-  missing payload masked invalid fields. Recovery would treat such a record as a
-  torn tail and silently truncate it instead of failing closed.
-- Fix: Validate all header fields before the length check. Commit 8bddb8c.
-- Regression test: the two tests above.
-
-## B-003: Writable-file factories accepted embedded NUL paths 
-
-- Symptom: A path containing `abc\0suffix` was accepted.
-  NewWritableFile created `abc`; OpenAppendableFile returned a writable
-  handle to an existing `abc`. Found while reviewing path validation
-  during the directory-operations task.
-
-- Cause: OpenPosixFile passed the path to open without checking for
-  embedded NUL bytes. The syscall interpreted only the prefix before NUL.
-
-- Fix: Reuse CheckSyscallPath before allocation and open in
-  src/core/posix_file.cc. Invalid paths return InvalidArgument without
-  opening the prefix path. Empty paths are also rejected consistently.
-
-- Verification: CreateNewRejectsEmbeddedNulPath and
-  OpenAppendableRejectsEmbeddedNulPath both failed before the fix and
-  passed afterward. The full suite passed 151/151 under ASan/UBSan.
-  Regression commit: 19b3cf3. Fix commit: cca0dd1.
-
-## B-004: A stale MANIFEST.tmp that Open could not remove blocked every flush
-
-- Symptom: If Open's best-effort orphan cleanup failed to unlink a leftover
-  `MANIFEST.tmp` (for example, EACCES), every later flush failed at the
-  exclusive create of `MANIFEST.tmp` with IOError. The handle then moved to
-  NeedsRecovery, and each reopen repeated the cycle while the unlink kept
-  failing.
-- Found by: Code review of the uncommitted M2 publication path, before the
-  M2 code was committed. Confirmed by a regression test.
-- Cause: Publication creates `MANIFEST.tmp` with O_EXCL. The deferred-orphan
-  retry ran only in cleanup (F7), after that create.
-- Fix: Before writing `MANIFEST.tmp` (F4), retry the removal of a deferred
-  `MANIFEST.tmp`. If the retry fails, it is an ordinary publication failure
-  (src/core/db.cc, `DB::Impl::PublishFlush`).
-- Verification: `DBM2Test.StaleManifestTempThatOpenCouldNotRemoveDoesNotBlockFlush`
-  failed at the triggering `Put` when built against the pre-fix `db.cc`, and
-  passes with the fix. The unlink failure is injected through the syscall
-  seam; it was not observed on a real filesystem.
-- Commits: the fix and the regression test were committed together with
-  the M2 integration in f7e4fff. There is no separate pre-fix commit; the
-  pre-fix failure was observed in a local development build.
+| ID | Summary | Area | Fix commit |
+|---|---|---|---|
+| [B-005](#b-005-open-retired-files-and-acknowledged-writes-on-a-manifest-not-known-to-be-durable) | Open trusted a manifest whose directory sync never completed | recovery ordering | f7e4fff |
+| [B-006](#b-006-sst-open-allocated-a-footer-declared-index-of-any-size-that-fit-the-file) | A crafted footer caused an unbounded allocation | SST validation | 855168d |
+| [B-002](#b-002-decodewalrecord-reported-invalid-tail-records-as-incomplete) | Invalid WAL records were treated as a torn tail | WAL recovery | 8bddb8c |
+| [B-004](#b-004-a-stale-manifesttmp-that-open-could-not-remove-blocked-every-flush) | A stale `MANIFEST.tmp` blocked every flush | publication | f7e4fff |
+| [B-007](#b-007-the-compaction-merge-missed-duplicate-sequences-behind-a-newer-version) | Merge missed a duplicate-sequence conflict | compaction | 53e53ed |
+| [B-003](#b-003-writable-file-factories-accepted-embedded-nul-paths) | Paths with an embedded NUL opened a different file | file I/O | cca0dd1 |
+| [B-001](#b-001-decodefixed3264-mis-decoded-bytes--0x80) | Fixed-width decoding sign-extended bytes | encoding | 0bfc9cb |
 
 ## B-005: Open retired files and acknowledged writes on a manifest not known to be durable
-
-- Symptom: After a flush renamed `MANIFEST.tmp` over `MANIFEST` but its
-  directory fsync failed (handle invalidated) or never ran (crash), the
-  next Open read the new generation and immediately unlinked the old WAL
-  and other covered orphans. It then acknowledged new writes, all without
-  any directory sync. Under power loss the directory could revert to the
-  older generation, whose WAL had already been deleted.
-- Found by: Review of M2 recovery ordering against design.md section 8
-  step 4, before the M2 code was committed.
-- Cause: Recovery trusted the visible MANIFEST as durable. Only the
-  publication path synced the directory after a manifest rename.
-- Fix: `DB::Impl::Recover` (src/core/db.cc) fsyncs the database directory
-  after validation and replay, and before `RemoveOrphansAtOpen` and before
-  the handle is exposed. A failure returns IOError and removes nothing
-  (D-016).
-- Verification: `UnsyncedManifestTest.OpenSyncsDirectoryBeforeRetiringOrAcknowledging`
-  failed ("Open never synced the directory") and
-  `UnsyncedManifestTest.FailedOpenDirectorySyncRetiresNothing` failed
-  (the old WAL was unlinked and a handle was returned) before the fix;
-  both pass after it. The failed sync is injected through the syscall
-  seam. Power loss itself is not simulated in M2.
-- Commits: the fix is part of the M2 integration commit f7e4fff, and the
-  regression tests are in ec97213. There is no separate pre-fix commit;
-  the pre-fix failures were observed in a local development build.
+- **Symptom:** after a flush renamed `MANIFEST.tmp` over `MANIFEST` but its directory fsync failed
+  (handle invalidated) or never ran (crash), the next Open read the new generation, immediately unlinked
+  the old WAL and other covered orphans, and acknowledged new writes, all without any directory sync.
+- **Impact:** under power loss the directory could revert to the older generation, whose WAL had already
+  been deleted: acknowledged writes lost.
+- **Root cause:** recovery trusted the visible MANIFEST as durable; only the publication path synced the
+  directory after a manifest rename.
+- **Found by:** review of the recovery ordering against design.md section 8, step 4, before the code was
+  committed.
+- **Fix:** `DB::Impl::Recover` (`src/core/db.cc`) fsyncs the database directory after validation and
+  replay, before `RemoveOrphansAtOpen` and before exposing the handle. A failure returns IOError and
+  removes nothing (D-016).
+- **Regression tests:** `UnsyncedManifestTest.OpenSyncsDirectoryBeforeRetiringOrAcknowledging` and
+  `UnsyncedManifestTest.FailedOpenDirectorySyncRetiresNothing` (both failed before the fix; the failed
+  sync is injected through the syscall seam). The crash matrix's TailRepair workload, added later, also
+  crashes at the Open-time directory sync under both crash models (failure-matrix.md section 2).
+- **Commits:** fix in f7e4fff, tests in ec97213; the pre-fix failure was observed in a local build.
 
 ## B-006: SST Open allocated a footer-declared index of any size that fit the file
+- **Symptom:** `SstTable::Open` read the whole footer-declared `index_length` after checking only that it
+  fit inside the file. A sparse 268,435,529-byte file (8 KiB on disk) with a 256 MiB declared index made
+  Open throw `std::bad_alloc` under a 128 MiB `RLIMIT_AS` instead of returning Corruption.
+- **Impact:** a malformed file could exhaust memory before being rejected.
+- **Root cause:** the file size was the only bound on the allocation, and a sparse file makes a large
+  declared size cheap; the format had no limit on index size or block count.
+- **Found by:** review of the SST reader before the code was committed.
+- **Fix:** format limits `kMaxSstBlocks` (1,048,576) and `kMaxSstIndexSize` (64 MiB). `DecodeFooter`
+  rejects an impossible `index_length` before allocating, `DecodeIndex` rejects an oversized block count,
+  and `SstBuilder` enforces both limits when writing (D-010, sst-format.md section 3.6).
+- **Regression tests:** `SstTest.ImpossibleIndexLengthIsRejectedBeforeTheIndexIsRead`,
+  `SstTest.IndexLengthAboveTheFormatLimitIsRejectedBeforeTheIndexIsRead`,
+  `SstTest.IndexBlockCountAboveTheLimitIsCorruption`. They count requested `pread` bytes through the
+  syscall seam, so they never allocate the declared size.
+- **Consequence:** a flush whose output would exceed a limit fails without losing acknowledged data. The
+  default `memtable_bytes` cannot reach the limits.
+- **Commits:** 855168d (with the SST module), format text in 0d48e5c.
 
-- Symptom: `SstTable::Open` allocated and read the whole `index_length`
-  from the footer after checking only that the index fit inside the file.
-  A malformed sparse SST therefore caused a large allocation before its
-  impossible index was rejected. Reproduction against the pre-fix source:
-  a valid 25-byte data block, `index_length` 256 MiB, a correctly
-  checksummed v1 footer, and a matching file size (268,435,529 bytes,
-  8 KiB allocated on disk). Opened in a separate non-sanitizer process
-  under a 128 MiB `RLIMIT_AS`, Open threw `std::bad_alloc` instead of
-  returning Corruption.
-- Found by: Review of the uncommitted M2 SST reader, before the M2 code
-  was committed.
-- Cause: The only bound on the index allocation was the file size, and a
-  sparse file makes a large declared size cheap. No format limit existed
-  on the index size or block count, so the writer had no matching limit
-  either.
-- Fix: New format limits `kMaxSstBlocks` (1,048,576) and
-  `kMaxSstIndexSize` (64 MiB, trailer included) in src/core/sst.h. The
-  reader (`DecodeFooter`, src/core/sst.cc) rejects an index_length above
-  min(floor(index_offset / 25), 2^20) x (16 + 65,536) + 8 or above 64 MiB
-  before allocating, and `DecodeIndex` rejects a block_count above the
-  limit. `SstBuilder::FlushBlock` checks both limits before writing each
-  block and returns InvalidArgument. Recorded in D-010.
-- Verification: `SstTest.ImpossibleIndexLengthIsRejectedBeforeTheIndexIsRead`
-  failed before the fix (Open requested 268,435,504 pread bytes for the
-  256 MiB case, and 65,609 for the bound plus one, instead of the 48-byte
-  footer, and reported "index checksum mismatch").
-  `SstTest.IndexLengthAboveTheFormatLimitIsRejectedBeforeTheIndexIsRead`
-  failed the same way (67,108,913 bytes), and
-  `SstTest.IndexBlockCountAboveTheLimitIsCorruption` failed with "extends
-  past the index". All three pass after the fix; the tests count requested
-  pread bytes through the syscall seam and never allocate the declared
-  size. The `RLIMIT_AS` reproduction, rebuilt against the fixed source,
-  returns Corruption ("index length 268435456 exceeds the limit 65560 for
-  a data region of 25 bytes"). Writer boundaries are tested with lowered
-  limits.
-- Consequence: a flush whose output would exceed a limit fails. The
-  default memtable_bytes cannot reach either limit; a much larger one with
-  long keys can, and the database then refuses mutations that need a
-  flush without losing acknowledged data (D-010, docs/sst-format.md
-  section 3.6).
-- Commits: the limits, the fix, and the regression tests were committed
-  together with the SST module in 855168d, and the format text in
-  0d48e5c. There is no separate pre-fix commit.
+## B-002: DecodeWalRecord reported invalid tail records as Incomplete
+- **Symptom:** a record with a valid header CRC but an invalid field (an over-limit length, a Delete with
+  a value, a bad sequence) and a truncated payload decoded as Incomplete instead of Corruption.
+- **Impact:** recovery would have treated a corrupt record as a torn tail and silently truncated it
+  instead of failing closed.
+- **Root cause:** the "remaining < total" check ran before field validation, so a missing payload masked
+  invalid fields.
+- **Found by:** `WalRecordMalformedTest.OversizedLengths` and
+  `WalRecordMalformedTest.InvalidFieldsWithMissingPayloadAreCorruption`.
+- **Fix:** validate every header field before the length check.
+- **Regression tests:** the two tests above.
+- **Commits:** 8bddb8c.
+
+## B-004: A stale MANIFEST.tmp that Open could not remove blocked every flush
+- **Symptom:** if Open's best-effort cleanup could not unlink a leftover `MANIFEST.tmp` (for example
+  EACCES), every later flush failed at the exclusive create of `MANIFEST.tmp`, moved the handle to
+  NeedsRecovery, and each reopen repeated the cycle.
+- **Impact:** a permanently unwritable database while the unlink kept failing; no data loss.
+- **Root cause:** publication creates `MANIFEST.tmp` with `O_EXCL`, but the deferred-orphan retry ran only
+  in cleanup (F7), after that create.
+- **Found by:** review of the publication path before the code was committed.
+- **Fix:** retry the removal of a deferred `MANIFEST.tmp` before writing it (F4); a failure there is an
+  ordinary publication failure (`DB::Impl::PublishFlush`).
+- **Regression tests:** `DBM2Test.StaleManifestTempThatOpenCouldNotRemoveDoesNotBlockFlush` (failed
+  against the pre-fix code; the unlink failure is injected through the syscall seam).
+- **Commits:** f7e4fff (fix and test together).
 
 ## B-007: The compaction merge missed duplicate sequences behind a newer version
+- **Symptom:** for one key with sequences 10, 5 and 5 (two different values at 5), input orders
+  [10, 5, 5] and [5, 10, 5] returned the sequence-10 version without reporting the conflict.
+- **Impact:** a missed Corruption report; the winner was still correct and no data was lost. The input
+  is very hard to reach through the engine, because Open checks every SST's sequence range and flush runs
+  have disjoint, ordered intervals.
+- **Root cause:** each version was compared only with the current winner, so once the newer version won,
+  the two equal older sequences were never compared with each other.
+- **Found by:** review of the merge before the code was committed.
+- **Fix:** every pair of versions of the current key is compared before the winner is chosen
+  (`src/core/compaction.cc`), independent of input order.
+- **Regression tests:** `CompactionInputTest.MergeRejectsDuplicateSequencesBehindANewerVersion` (all six
+  input orders; 4 of 6 returned Ok before the fix).
+- **Commits:** 53e53ed (fix and test together).
 
-- Symptom: `MergingIterator::Settle` compared each version of a key only
-  with the current winner. For one key with sequences 10, 5, and 5 (two
-  different values at sequence 5), input orders [10, 5, 5] and
-  [5, 10, 5] returned the sequence-10 version without reporting the
-  conflict; only [5, 5, 10] was detected.
-- Found by: Review of the uncommitted M3 merge, before the M3 code was
-  committed.
-- Impact: A missed Corruption report in the merge component. The selected
-  winner was still the correct sequence-10 version, and no data loss was
-  observed. Through normal database operation the input is very hard to
-  reach: the manifest requires disjoint, ordered sequence intervals for
-  flush runs, Open checks every SST's actual sequence range, and keys are
-  unique within an SST.
-- Cause: The check compared each version only with the current
-  winner. Once the newer version became the winner, the two equal
-  older sequences were never compared with each other.
-- Fix: Every pair of versions of the current key is compared before the
-  winner is chosen (src/core/compaction.cc), independent of input order.
-- Verification: `CompactionInputTest.MergeRejectsDuplicateSequencesBehindANewerVersion`
-  (all six input orders, and the conflict found by Next after the first
-  key) failed before the fix: 4 of 6 orders returned Ok instead of
-  Corruption, and the Next path also returned Ok. It passes after the
-  fix.
-- Commits: the fix and the regression test were committed together
-  with the compaction merge in 53e53ed. There is no separate pre-fix
-  commit.
+## B-003: Writable-file factories accepted embedded NUL paths
+- **Symptom:** a path `abc\0suffix` was accepted: `NewWritableFile` created `abc`, and
+  `OpenAppendableFile` returned a writable handle to an existing `abc`.
+- **Impact:** a caller-supplied path could open a different file than the one named.
+- **Root cause:** `OpenPosixFile` passed the path to `open` without checking for embedded NUL bytes, so
+  the syscall used only the prefix.
+- **Found by:** review of path validation while adding the directory operations.
+- **Fix:** reuse `CheckSyscallPath` before allocating and opening (`src/core/posix_file.cc`); invalid and
+  empty paths return InvalidArgument.
+- **Regression tests:** `CreateNewRejectsEmbeddedNulPath`, `OpenAppendableRejectsEmbeddedNulPath` (both
+  failed before the fix).
+- **Commits:** tests in 19b3cf3, fix in cca0dd1.
+
+## B-001: DecodeFixed32/64 mis-decoded bytes >= 0x80
+- **Symptom:** `DecodeFixed32("\x80\x00\x00\x00")` returned 0xFFFFFF80 instead of 0x80;
+  `DecodeFixed64` aborted under UBSan ("shift exponent 32 is too large for 32-bit type 'int'").
+- **Impact:** wrong lengths and checksums for any encoded byte with the high bit set.
+- **Root cause:** the 32-bit path cast signed `char` directly to `uint32_t` (sign extension); the 64-bit
+  path shifted as `int` before widening (undefined for shifts of 32 or more).
+- **Found by:** golden-byte and round-trip coding tests (32-bit) and UBSan (64-bit).
+- **Fix:** `char` → `unsigned char` → `uintN_t`, then shift.
+- **Regression tests:** `Coding.DecodeFixed32FromSpecifiedBytes`, `Coding.DecodeFixed64FromSpecifiedBytes`.
+- **Commits:** 0bfc9cb.
