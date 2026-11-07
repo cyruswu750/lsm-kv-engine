@@ -2,154 +2,22 @@
 
 [![CI](https://github.com/cyruswu750/lsm-kv-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/cyruswu750/lsm-kv-engine/actions/workflows/ci.yml)
 
-An embedded persistent byte-key/byte-value store in C++20, built to study
-recovery of acknowledged writes, safe publication of on-disk state, and the
-costs of durability. It does not use LevelDB or RocksDB as its storage
-implementation, and its formats are intentionally not LevelDB compatible.
-The design contract is [docs/design.md](docs/design.md). The exact
-SSTable, manifest, naming, and directory-state rules are in
-[docs/sst-format.md](docs/sst-format.md); compaction and the crash
-simulator are specified in [docs/m3-design.md](docs/m3-design.md), and
-Bloom filters, counters, and benchmarks in
-[docs/m4-design.md](docs/m4-design.md).
+A crash-consistent LSM-tree key-value store in C++20, written from scratch and verified with fault
+injection, differential testing, and a deterministic syscall-level crash simulator. Every `Put` and
+`Delete` that returns `Ok` has been fsynced to a checksummed write-ahead log; new on-disk state is
+published through a temporary file, fsync, rename and directory fsync.
 
-The badge shows the result of the latest remote CI run. Local test results
-are not a substitute for it.
+- **Crash recovery:** 793 enumerated crash points across 7 workloads, each recovered under a
+  process-crash model and a simulated power-loss model and checked by a response-aware oracle.
+  A planted bug (a skipped SST fsync) is caught only under simulated power loss.
+- **Test suite:** 534 GoogleTest cases under ASan and UBSan, including fault injection at 32 flush and
+  compaction publication call sites (each with EIO and ENOSPC) and 800,000 seeded differential
+  operations against a reference map on every CI run.
+- **Bloom filters:** 99.2% fewer data-block requests per missing-key lookup than with filter queries
+  bypassed (0.008 vs 1.000 on the benchmark's 200,000-key database), at about 1.25 bytes per key.
 
-Verification status of the M2 code (commit c6a410f):
-
-- Remote CI: GitHub Actions run 41539015954 on c6a410f succeeded (Debug,
-  ASan and UBSan, 400 tests passed).
-- Local: the same 400 tests passed in a Debug ASan/UBSan build with test
-  data on ext4, with no skipped or disabled tests.
-- Release tag: `v0.2-m2` (annotated) is on `6d702e4`; the commits
-  after `c6a410f` change documentation only.
-
-Verification status of the M3 code (merge commit 2845a02):
-
-- Remote CI: GitHub Actions run 41596578142 on 2845a02 (the push to
-  `main`) succeeded (Debug, ASan and UBSan, 493 tests passed), as did
-  run 41594389993 for pull request #1.
-- Local: before it was committed, the M3 code passed the same 493 tests
-  in a Debug ASan/UBSan build with test data on ext4, with no skipped or
-  disabled tests and no sanitizer report. The committed code differs from
-  that tree only in two comments.
-- Release tag: `v0.3-m3` (annotated) is on `2845a02`.
-
-Verification status of the M4 code:
-
-- Local: before it was committed, the M4 code passed 534 tests in a
-  Debug ASan/UBSan build with test data on ext4, with no skipped or
-  disabled tests and no sanitizer report (docs/failure-matrix.md). The
-  committed code differs from that tree only in three comments.
-- Not yet done: remote CI for the M4 commits, the owner's review of M4,
-  and a release tag.
-
-## Status: M4 (Bloom filters, counters, benchmarks)
-
-M1 (WAL and memtable), M2 (SSTables, flush, manifest), M3 (full
-compaction, crash simulator), and M4 are implemented.
-
-Implemented in M1:
-
-- `DB::Open`, `Put`, `Get`, `Delete` (`src/core/db.h`). Mutations are
-  synchronous: encode, append the WAL record, fsync, apply to the memtable,
-  then return `Ok`.
-- An ordered `std::map` memtable with tombstones, so an empty value is
-  distinct from a deleted key.
-- WAL v1 (design.md section 6): a 16-byte file header, then records with a
-  28-byte header and separate header and payload CRC-32C checksums.
-- Recovery (design.md section 7): replay from byte 16, truncate and sync an
-  incomplete trailing record before any append, and fail closed on
-  corruption, including a bad final record.
-- An exclusive `flock` on `LOCK` (a second opener gets `Busy`), and
-  rejection of unrelated or non-regular entries.
-- After any failure once persistence has begun, the handle returns
-  `NeedsRecovery` for every later call. A failed fsync is never retried.
-
-Implemented in M2 (docs/sst-format.md):
-
-- SSTable version 1: 4 KiB target data blocks (a larger single entry gets
-  its own block), a sparse index with one entry per block, a 48-byte
-  footer, and CRC-32C on every block, the index, and the footer. Open
-  validates every referenced SST by streaming its blocks; Get re-validates
-  the block it reads.
-- A single-record, checksummed `MANIFEST` naming the active WAL, the
-  checkpoint sequence, the next file ID, a generation, and the live SSTs
-  with their exact sequence ranges. It is replaced through
-  `MANIFEST.tmp`, fsync, rename, and directory fsync.
-- Synchronous flush before a valid mutation when the memtable reaches
-  `Options::memtable_bytes`: SST and new WAL synced and renamed, one
-  directory fsync, manifest published, state installed, old WAL removed.
-  Publication failures move the handle to `NeedsRecovery`. A failed
-  unlink during cleanup is not an error. A failed cleanup directory fsync
-  is.
-- Lookup: memtable, then SSTs from newest to oldest, stopping at the
-  first value or tombstone.
-- M2 file names (`wal-000001.log`, `sst-000002.sst`). An M1 directory is
-  rejected with `UnsupportedFormat` and left unchanged; there is no
-  migration. Interrupted first initialization leaves residue that is
-  reported as `Corruption` and preserved.
-- File IDs are never reused: allocation starts above the manifest's
-  high-water mark and every ID observed on disk. High-ID orphans are kept
-  until a published manifest covers them. Sequence, file-ID, and
-  generation exhaustion reject mutations before any I/O.
-
-Implemented in M3 (docs/m3-design.md, docs/sst-format.md section 4):
-
-- Full compaction before the next mutation once the logical run count
-  reaches an internal threshold (default 4; the base run counts once,
-  each flush run once). Every live SST is merged into one base run of
-  key-partitioned SSTs, each within the per-SST block and index
-  limits, published by one manifest. Winning tombstones are dropped
-  because every older version is an input; the active WAL and the
-  checkpoint are kept.
-- Manifest version 2 with a base run count. M2 databases (manifest
-  version 1) are rejected with `UnsupportedFormat` and left unchanged;
-  there is no migration. An M2 executable rejects M3 databases the
-  same way.
-- Lookup: memtable, then flush-run SSTs from newest to oldest, then
-  the one base SST whose key range can hold the key; the first value
-  or tombstone wins.
-- Every filesystem call of the engine goes through the syscall seam,
-  including directory listing, lstat, mkdir, and the lock (D-020).
-- A deterministic crash simulator behind the seam
-  (`src/testing/crash_sim.h`): 7 fixed workloads with enumerated crash
-  points (756 in M3; 793 since M4, because every SST also writes its
-  filter), each recovered under a process-crash model and an
-  unsynced-state-loss model and checked by a response-aware oracle.
-  These are simulated failures, not hardware power-loss evidence.
-
-Implemented in M4 (docs/m4-design.md, docs/sst-format.md section 3.7):
-
-- SST version 2: one Bloom filter per SST of every stored key,
-  tombstones included, with a hash defined by the format (KVHASH1);
-  10 bits per key and 7 probes by default. Version 1 SSTs stay readable
-  beside version 2 SSTs in one database.
-- Lookup skips an SST without I/O when the key is outside its key range
-  or its filter answers "absent"; a positive answer always reads the
-  block.
-- A damaged filter fails Open (checksum, bounds, key count, or a stored
-  key the filter would deny); a filter is never trusted unchecked. The
-  filter size is bounded before allocation, and a filter-bearing SST
-  holds at most 2^22 keys; compaction splits outputs at that limit
-  (D-027 to D-029).
-- Internal counters (lookups, data-block requests, user, WAL, SST, and
-  metadata bytes) and internal switches (filter bits per key, a
-  benchmark-only filter-query bypass), outside the public Options
-  (D-030).
-- A Release benchmark driver (`bench/`, CMake option `KV_BUILD_BENCH`,
-  off by default) and runner scripts for four experiment groups. Its
-  sync bypass exists only in the driver.
-
-Settled design decisions and their validating tests are in
-[docs/decisions.md](docs/decisions.md). Observed defects are in
-[docs/BUGLOG.md](docs/BUGLOG.md).
-
-## Build and test
-
-Requires Linux, CMake 3.20 or newer, Ninja, and GCC or Clang with C++20.
-GoogleTest is fetched at configure time.
+## Quick start
+Linux, CMake 3.20+, Ninja, and GCC or Clang with C++20. GoogleTest is fetched at configure time.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DKV_SANITIZE=ON -DBUILD_TESTING=ON
@@ -157,164 +25,121 @@ cmake --build build
 ctest --test-dir build --output-on-failure --parallel "$(nproc)"
 ```
 
-`KV_SANITIZE=ON` builds everything with AddressSanitizer and
-UndefinedBehaviorSanitizer. CI ([.github/workflows/ci.yml](.github/workflows/ci.yml))
-runs exactly this configuration on every push to `main` and on every pull
-request.
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs exactly this configuration on every push
+to `main` and every pull request. The suite is fsync-bound: run it on a real disk to exercise real
+syncs (on tmpfs, fsync is effectively free).
 
-### Differential tests
+```cpp
+#include "core/db.h"
 
-`Seeds/DifferentialTest.*` compares eight workloads against an independent
-reference map: the memtable; the DB without reopen; the DB with a reopen
-every 500 operations; and the same two DB workloads with a 4 KiB memtable
-(`DbFlushWithoutReopen`, `DbFlushPeriodicReopen`, compaction disabled),
-so flushes and SST lookups happen throughout; and two compaction
-workloads, `DbCompactionPeriodicReopen` (threshold 2; 34 to 49
-compactions per seed) and `DbMultiOutputCompactionPeriodicReopen`
-(lowered SST limits, base runs of 2 to 3 SSTs; 332 to 355 compactions
-per seed); and `DbMixedFilterPeriodicReopen` (M4), which alternates
-filters between opens so filterless and filter-bearing SSTs are live
-together. The flush workloads read the published MANIFEST
-with an independent parser and require at least `KV_DIFF_OPS / 500` flushes
-per seed. Each seed records its flush count as a test property. Seeds
-1-20 at 5000 operations produced 35 to 50 flushes each. It runs 20 seeds x
-5000 operations per workload, and CI pins these values. Environment
-variables:
+kv::Options options;                      // create_if_missing, 4 MiB memtable
+std::unique_ptr<kv::DB> db;
+kv::Status s = kv::DB::Open("/tmp/mydb", options, db);
+if (s.ok()) s = db->Put("user:1", "alice");  // Ok = appended to the WAL and fsynced
+std::string value;
+if (s.ok()) s = db->Get("user:1", value);    // value == "alice"
+if (s.ok()) s = db->Delete("user:1");        // a durable tombstone
+```
 
-| Variable | Default | Meaning |
+This snippet shows the API shape; the test suites (`tests/harness/db_test.cpp` and others) exercise
+the same calls.
+
+## Architecture
+
+```
+Put/Delete ─► validate ─► [flush if memtable full] ─► [compact if run count ≥ threshold]
+          ─► append WAL record ─► fsync WAL ─► apply to memtable ─► Ok
+
+Get ─► memtable ─► flush-run SSTs, newest first ─► the one base-run SST whose key range holds the key
+       (an SST is skipped without I/O if the key is outside its range or its Bloom filter says absent)
+```
+
+- **WAL:** records with separate CRC-32C checksums over the header and the payload. Recovery replays the
+  complete records; an incomplete trailing record is truncated and synced before any append, while a
+  checksum or field error in any complete record, including the last one, fails Open.
+- **Memtable:** an ordered map of values and tombstones with sequence numbers.
+- **SSTables:** 4 KiB target data blocks (a larger entry gets its own block), a sparse index, a footer, and a Bloom filter (10 bits per key), each
+  with its own CRC-32C. Open validates every live SST in full; `Get` revalidates the block it reads.
+- **Manifest:** one checksummed record naming the live SSTs and their runs, the active WAL, the
+  checkpoint sequence and the file-ID high-water mark. It is replaced atomically, never edited.
+- **Flush:** write the SST and a new empty WAL, sync and rename both, sync the directory once, publish
+  the new manifest, then retire the old WAL.
+- **Compaction:** a full merge of every live SST into one key-partitioned base run. Because every older
+  version is an input, winning tombstones can be dropped safely.
+- **Syscall seam:** every filesystem call goes through one injectable interface, which the fault
+  injector and the crash simulator replace in tests.
+
+Details: [docs/design.md](docs/design.md); byte formats and directory states:
+[docs/sst-format.md](docs/sst-format.md).
+
+## Durability contract
+Guaranteed, under the filesystem's fsync contract:
+- An `Ok` from `Put` or `Delete` means the record was appended and fsynced, and every file and directory
+  entry it depends on was durably published. Recovery preserves it unless a later recovered mutation
+  supersedes it.
+- An operation that was interrupted, or that failed after persistence began, has an uncertain outcome:
+  after recovery it is either completely present or absent, never partially decoded.
+- A failed fsync is never retried (a later success would not prove the data reached storage). The handle
+  enters `NeedsRecovery`, and every later call returns that status without I/O until the database is
+  reopened.
+- Open never deletes or acknowledges anything on top of a manifest whose rename might not be durable:
+  it syncs the directory first (B-005, D-016).
+- A checksum or field error in the WAL (only an incomplete trailing record is repaired, never a
+  complete record with a bad CRC, even the last one), an SST, a filter or the manifest fails closed;
+  nothing is repaired or reconstructed from a directory listing.
+
+Not established: behavior under real power loss, device write caches, torn sector writes, writeback
+reordering within a file, or media errors. The crash simulator models only the two crash models above,
+and a reopen validates only what the filesystem returns.
+
+## How correctness is tested
+
+| Technique | What it covers | Where |
 |---|---|---|
-| `KV_DIFF_FIRST_SEED` | 1 | Seeds used are `FIRST_SEED` .. `FIRST_SEED+19` |
-| `KV_DIFF_OPS` | 5000 | Operations per seed and workload |
-| `KV_DIFF_REOPEN_EVERY` | 500 | Reopen interval for `DbPeriodicReopen` |
+| Byte-level truncation and mutation | the WAL cut at every byte (222 cuts), every SST byte truncated and bit-flipped, malformed manifests; never an unbounded allocation | `DBRecoveryTest.*`, `SstTest.*`, `Manifest.*` |
+| Syscall fault injection | EIO, ENOSPC, EINTR, short transfers and exceptions in flush and compaction publication (every syscall of flush steps F1–F5), cleanup and recovery reads; the publication fault tests assert that each injected fault was reached | `DBFaultTest.*`, `PublishFaultTest.*`, `CompactionFaultTest.*`, `UnsyncedManifestTest.*` |
+| Crash simulator | 793 crash points × 2 models = 1,586 recoveries, judged by a response-aware oracle | `Workloads/CrashMatrixTest.*` |
+| Mutation check | a skipped SST fsync must be caught under simulated power loss and only there | `Workloads/CrashMutationTest.*` |
+| Differential testing | 8 workloads × 20 seeds × 5,000 operations with reopens, flushes, multi-output compactions and mixed filter versions | `Seeds/DifferentialTest.*` |
 
-For more seeds, run `scripts/run_differential.sh [BLOCKS] [OPS]`, which
-runs 20-seed blocks. A failure prints the seed, operation index, the last
-operations, and a reproduce command, and writes the full trace up to the
-failing operation to a `.trace` file in the working directory. Traces are
-not automatically minimized.
+Every check, its expected result and its regression test: [docs/failure-matrix.md](docs/failure-matrix.md).
 
-The DB workloads are fsync-bound. On an ext4 disk under WSL2, one M1
-`DbPeriodicReopen` seed took about 18 seconds. On tmpfs, fsync is
-effectively free. The tests create their directories under the system
-temporary directory, so where that lives decides which case a run measures.
+## Bugs found
+Seven defects were found during development and each is pinned by a regression test
+([docs/BUGLOG.md](docs/BUGLOG.md)). Three examples:
+- **B-005:** Open deleted the old WAL and acknowledged writes on a manifest whose directory fsync had
+  never completed; under power loss the directory could revert to a generation whose WAL was gone.
+- **B-006:** a crafted SST footer could declare a 256 MiB index in a sparse file and force a huge
+  allocation before being rejected; the format now bounds the index before reading it.
+- **B-002:** a corrupt WAL record with a truncated payload was classified as a torn tail and would have
+  been silently truncated instead of failing closed.
 
-## What the tests do and do not show
-
-- Fault tests inject syscall results (short writes and reads, EINTR,
-  ENOSPC, EIO, failed open, close, rename, unlink, and fsync, and
-  exceptions) through an internal per-object seam (decisions D-004 and
-  D-014). They exercise the engine's control flow and recovered state.
-  Each M2 publication fault test asserts that the injected fault was
-  actually reached.
-- The crash simulator (M3) terminates the engine at the enumerated
-  points of fixed workloads and recovers under two models: a process
-  crash, and the loss of every unsynced file content and directory
-  entry. It does not model torn sector writes, writeback reordering
-  inside a file, or device failures. No test discards a real page
-  cache or cuts power. Results show behavior under the filesystem's
-  fsync contract, not hardware durability.
-  WSL2 results also depend on host storage.
-
-### M1 failure matrix
-
-"Seam" means syscall results injected through `DBOpener` (D-004, D-014).
-"Passes locally" means passing in local sanitizer builds; remote CI is
-reported only by the badge. Test names are GoogleTest suite.name. The rows
-below cover the WAL paths introduced in M1; they run against the M2 layout,
-where the WAL is `wal-<id>.log` and is named by MANIFEST.
-
-| Checkpoint | Mechanism | Expected result | Test | Status |
-|---|---|---|---|---|
-| WAL append: short writes, EINTR | Seam | Exact record written, `Ok` | `DBFaultTest.ShortWritesAndEintrStillWriteExactRecord` | Passes locally |
-| WAL append: partial then EIO; ENOSPC/EIO before progress | Seam | `IOError`, then `NeedsRecovery` with no I/O; reopen yields the prior prefix | `DBFaultTest.AppendFailureInvalidatesHandleAndRecoversPrefix` | Passes locally |
-| WAL fsync: EIO, ENOSPC, EINTR | Seam | One fsync, `IOError`, `NeedsRecovery`; reopen yields prefix or prefix + failed op | `DBFaultTest.SyncFailureInvalidatesHandleWithoutRetry`, `DBFaultTest.OverwriteWithFailedSyncRecoversOldOrNewValue` | Passes locally |
-| Exception during append or fsync | Seam | Handle invalidated, exception propagates | `DBFaultTest.ExceptionAfterPersistenceBeginsInvalidatesHandle` | Passes locally |
-| Exception while applying to memtable | None | Handle invalidated (code review only) | None | Not tested |
-| Init: header write, tmp fsync | Seam | No handle; no WAL published; since M2, reopen reports the temporary file as preserved `Corruption` residue (M1 reinitialized) | `DBFaultTest.HeaderWriteFailureDuringInitialization`, `DBFaultTest.TempFileSyncFailureDoesNotPublishWal` | Passes locally |
-| Init: rename of the initial WAL | Seam (since M2) | No handle; residue is `Corruption` | `PublishFaultTest.InitializationFaultsExposeNoHandle` | Passes locally |
-| Init: directory fsync after the WAL rename; after the MANIFEST rename; parent fsync after mkdir | Seam | No handle; no rollback. Reopen: `Corruption` residue before MANIFEST exists (M1 reopened); success after the MANIFEST rename; uninitialized after mkdir | `DBFaultTest.DirectorySyncFailureAfterRenameExposesNoHandle`, `DBFaultTest.ManifestDirectorySyncFailureExposesNoHandle`, `DBFaultTest.ParentSyncFailureAfterCreatingDirectory` | Passes locally |
-| Recovery read: short, EINTR, EIO | Seam | Correct replay; EIO leaves WAL untouched | `TornTail.ShortReadsAndEintrDuringRecovery`, `TornTail.ReadErrorDuringRecoveryLeavesWalUntouched` | Passes locally |
-| Tail repair: ftruncate or fsync failure; ordering | Seam and event log | No handle and no append; ftruncate then fsync before first write | `TornTail.TruncateFailureLeavesWalAndExposesNoHandle`, `TornTail.SyncFailureDuringRepairExposesNoHandle`, `TornTail.RepairIsTruncatedAndSyncedBeforeFirstAppend` | Passes locally |
-| Torn WAL at every byte (222 cuts) | Byte truncation | Exact complete-record prefix, repaired length, append and reopen; header cuts are `Corruption` | `DBRecoveryTest.EveryCutRecoversCompletePrefixAndAcceptsAppend`, `DBRecoveryTest.EveryCutInsideFileHeaderIsCorruption` | Passes locally |
-| Corrupt bytes and malformed fields | Byte mutation, resealed CRCs | `Corruption` with path and offset; WAL unchanged | `DBRecoveryTest.*` mutation and malformed-field tests | Passes locally |
-| Second opener, same process | Real `flock` | `Busy`; open succeeds after release | `DBTest.SecondOpenInSameProcessIsBusy` | Passes locally |
-| Second opener, another process | Subprocess | `Busy` | None | Not tested |
-| Process termination at named checkpoints (append, sync, apply, response, init publication) | Subprocess kill | Ordered prefix plus optional in-flight op | None | Not tested |
-| Random operation traces with reopen | Differential, seeds 1-20 x 5000 ops | Matches the reference map | `Seeds/DifferentialTest.*` | Passes locally |
-| Power loss, lost writeback | None | Not modeled | None | Out of scope |
-
-### M2 failure matrix
-
-| Checkpoint | Mechanism | Expected result | Test | Status |
-|---|---|---|---|---|
-| Flush F1-F5: every open, write, fsync, close, and rename of the SST, new WAL, and manifest, plus both directory fsyncs | Seam (EIO, ENOSPC) | `IOError`, then `NeedsRecovery` with no I/O; reopen yields every acknowledged write and never reuses an observed file ID | `PublishFaultTest.EveryPublicationFailureRequiresRecovery` | Passes locally |
-| Exception during publication or cleanup | Seam | Handle invalidated; reopen yields the old or new generation | `PublishFaultTest.ExceptionBeforeOrAfterDurablePublication` | Passes locally |
-| Cleanup: unlink of the old WAL fails | Seam | `Ok`; the handle stays usable; removal is retried at the next flush | `PublishFaultTest.UnlinkFailureLeavesGarbageButKeepsTheHandle` | Passes locally |
-| Cleanup: directory fsync after unlink fails | Seam (EIO, EINTR) | `IOError`, `NeedsRecovery`, no retry; reopen yields the new generation | `PublishFaultTest.CleanupDirectorySyncFailureRequiresRecovery` | Passes locally |
-| Reopen after a MANIFEST rename whose directory fsync failed | Seam | Open fsyncs the directory before removing the old WAL or accepting writes; if that fsync fails, no handle and nothing removed | `UnsyncedManifestTest.*` | Passes locally |
-| Order of syncs and renames in a flush | Seam event trace | Each dependency synced once and renamed before the manifest refers to it; old WAL removed only after publication | `PublishFaultTest.FlushOrderSyncsEachDependencyOnceBeforePublication` | Passes locally |
-| Initialization: every step | Seam | No handle; residue before the MANIFEST rename is `Corruption` and preserved; after the rename, reopen succeeds | `PublishFaultTest.InitializationFaultsExposeNoHandle` | Passes locally |
-| SST read error at Open, and during Get | Seam | Open: no handle. Get: error returned, handle stays usable | `PublishFaultTest.SstReadFailureAtOpenExposesNoHandle`, `PublishFaultTest.SstReadFailureDuringGetKeepsTheHandle` | Passes locally |
-| SST truncated at every byte; every byte bit-flipped; malformed fields with valid CRCs | Byte truncation and mutation | `Corruption` (`UnsupportedFormat` for the version field) | `SstTest.*` | Passes locally |
-| Manifest truncated, bit-flipped, invalid fields, unknown version | Byte truncation and mutation | `Corruption` or `UnsupportedFormat`; never replaced | `Manifest.*`, `DBM2Test.MalformedManifestIsNeverTreatedAsANewDatabase` | Passes locally |
-| Missing, damaged, or mismatched referenced SST or WAL | File removal and mutation | `Corruption` (`UnsupportedFormat` for SST version 2); nothing changed | `DBM2ReferenceTest.*` | Passes locally |
-| Deleted key reappearing | Flushes and reopen | Never: a flushed tombstone or a WAL-only tombstone hides an older SST value | `DBM2Test.FlushedDeleteShadowsOlderFlushedValue`, `DBM2Test.WalOnlyDeleteShadowsFlushedValue` | Passes locally |
-| Random traces with frequent flushes | Differential, 4 KiB memtable, seeds 1-20 x 5000 ops, reopen every 500 | Matches the reference map; at least 10 flushes per seed | `Seeds/DifferentialTest.DbFlush*` | Passes locally |
-| Process termination or simulated power loss during publication | Crash simulator (M3) | Every enumerated crash point recovers under both models (docs/failure-matrix.md section 2) | `Workloads/CrashMatrixTest.*` | Passes locally |
-
-Coverage status: every testable item on the Week 1 and Week 2 checklists
-has a passing local test; remote CI, review, and release status are listed
-at the top. These items on the broader design.md section 10 roadmap remain
-open:
-
-- Failure-matrix documentation: docs/failure-matrix.md (M1-M3) lists
-  the mechanism, expected and observed result, and regression test of
-  each row, including compaction publication; the matrices above stay
-  compact.
-- Process termination and simulated power loss at enumerated
-  checkpoints: implemented by the M3 crash simulator for its fixed
-  workloads.
-- Cross-process lock testing: not implemented.
-
-## Performance (M4)
-
-Local measurements, warm page cache, from
-[bench/results/summary.md](bench/results/summary.md) (median [min, max]
-of 3 runs; raw data in `bench/results/raw/`; environment in
-`bench/results/environment.txt`; caveats in
-[bench/results/NOTES.md](bench/results/NOTES.md)). They were measured on
-the pre-integration M4 snapshot named in environment.txt, whose engine
-and benchmark driver differ from these commits only in source comments;
-they were not re-measured here. Environment: AMD Ryzen 9 7945HX (32
-logical CPUs), 7.9 GB RAM visible to WSL2, ext4 on a WSL2 virtual disk,
-GCC 15.2 `-O3`, sanitizers off. Keys 16 bytes, values 100 bytes, seed 42.
-Request counts are engine requests, not device reads. Latencies are per
-call and include about 20 ns of clock overhead. ops/s is calls divided
-by the summed per-call times; summary.md also reports wall ops/s, which
-counts the harness work between calls. Earlier results that used a
-different throughput definition are kept, superseded, in
-`bench/results/historical-2026-11-02T1825/`.
+## Performance
+Local measurements from [bench/results/summary.md](bench/results/summary.md): median [min, max] of 3
+runs, warm page cache, 16-byte keys and 100-byte values, seed 42; raw data in `bench/results/raw/`.
+Environment: AMD Ryzen 9 7945HX (32 logical CPUs), 7.9 GB RAM visible to WSL2, ext4 on a WSL2 virtual
+disk, GCC 15.2 `-O3`, sanitizers off. They were measured on the pre-integration M4 snapshot named in
+`bench/results/environment.txt`, whose engine and benchmark driver differ from the committed code
+only in source comments, and were not re-measured on the commits. Request counts are engine requests,
+not device reads; latencies are per call and include about 20 ns of clock overhead.
 
 | Experiment | Configuration | Result |
 |---|---|---|
-| 1. Synchronous inserts | 20,000 random Puts, 64 KiB memtable, threshold 4 | 217 [159, 219] ops/s; p50 4.48 ms, p99 5.97 ms, max 105 ms (maintenance included) |
-| 1. Reads | 200,000 keys, 50,000 lookups each, filters on | existing p50 12.1 us, p99 20.8 us; missing p50 0.14 us, p99 0.38 us |
-| 2. Sync bypass (unsafe reference) | same insert trace, every fsync skipped | 78,229 ops/s (about 360x); the gap is a sync-policy effect, not an exact fsync time share |
-| 3. Bloom on vs bypassed | same files, same missing-key trace (inside the key range) | data-block requests per lookup 0.008 vs 1.000 (-99.2%); bytes requested 31 vs 3,998; p50 0.14 vs 12.04 us |
+| 1. Synchronous inserts | 20,000 random `Put`s, 64 KiB memtable, run threshold 4 | 217 [159, 219] ops/s; p50 4.48 ms, p99 5.97 ms, max 105 ms (flush and compaction included) |
+| 1. Reads | 200,000 keys, 50,000 lookups each, filters on | existing p50 12.1 µs, p99 20.8 µs; missing p50 0.14 µs, p99 0.38 µs |
+| 2. Sync bypass (unsafe reference) | same insert trace, every fsync skipped | 78,229 ops/s (about 360×); the gap is a sync-policy effect, not an exact fsync time share |
+| 3. Bloom on vs bypassed | same files, same missing-key trace (inside the key range) | data-block requests per lookup 0.008 vs 1.000 (−99.2%); bytes requested 31 vs 3,998; p50 0.14 vs 12.04 µs |
 | 4. Run threshold 2 / 4 / 8 / off | same trace (20,000 ops over 10,000 keys, 10% deletes), same end | write amplification 16.06 / 6.95 / 4.20 / 2.42; DB bytes 1.06 / 1.11 / 1.32 / 2.45 MB; SST candidates per lookup 1.0 / 1.9 / 5.3 / 18.2; max insert latency 102 / 99 / 102 / 59 ms (see the caveat below) |
 
-Trade-offs seen: Bloom filters remove nearly all data-block requests for
-missing keys at about 1.25 bytes per key; in this setup the read database
-had compacted to one SST, so each lookup saved one block. Lower thresholds
-cut lookup candidates and database size but rewrite all live data more
-often (higher write amplification). Caveat for group 4 latencies:
-synchronous latency changed with time during the run (insert p50 about
-4.5 ms in the first two threshold runs, 6.6-7.0 ms in all later ones, in
-every configuration; cause not measured). Group 4 throughput and
-latencies, including the lower maximum without compaction (59 vs about
-100 ms), therefore cannot establish the causal effect of the threshold
-on latency; see bench/results/NOTES.md and the note in
-threshold_p99.svg.
+![Data-block requests per missing-key lookup, Bloom filters used vs bypassed](bench/results/read_bloom_blocks.svg)
+
+Trade-offs: Bloom filters remove nearly all data-block requests for missing keys at about 1.25 bytes
+per key (here the read database had compacted to one SST, so each lookup saved one block). Lower
+thresholds cut lookup candidates and database size but rewrite all live data more often. Caveat for
+group 4 latencies: synchronous latency changed with time during the run (insert p50 about 4.5 ms in the
+first two threshold runs and 6.6–7.0 ms in all later ones, in every configuration; cause not measured),
+so group 4 throughput and latencies, including the lower maximum without compaction, cannot establish
+the causal effect of the threshold on latency ([NOTES.md](bench/results/NOTES.md)).
 
 Reproduce:
 
@@ -325,59 +150,49 @@ scripts/run_benchmarks.sh build-bench/bench/kv_bench <data dir> <results dir>
 scripts/summarize_bench.py <results dir>
 ```
 
-## Limitations
+## Key design decisions
+- [D-008](docs/decisions.md): replace the manifest as one whole-file record rather than an edit log.
+- [D-012](docs/decisions.md): the publication order, and separate error classes for cleanup after
+  publication.
+- [D-016](docs/decisions.md): Open syncs the directory before retiring files or acknowledging writes.
+- [D-017](docs/decisions.md): full compaction of every live SST, trading write amplification for a simple
+  tombstone-safety argument.
+- [D-028](docs/decisions.md): a damaged Bloom filter fails Open; a filter is never trusted unchecked.
 
-- Recovery reads the whole active WAL into memory, so peak memory is about
-  twice its size (D-007). A flush retires the WAL when the memtable
-  reaches its threshold, but overwrites that do not grow the memtable
-  still grow the WAL.
-- Compaction is full, not leveled, and runs in the foreground inside
-  the `Put` or `Delete` that reaches the threshold; every compaction
-  rewrites all live data. Between compactions Get may probe every
-  flush-run SST and one base SST. Each probe opens and closes the file
-  (D-011).
-- Live data must fit in about 2^20 SSTs; a larger compaction fails
-  with `InvalidArgument` and `NeedsRecovery` before publication (D-024).
-- Open reads every live SST in full to validate it (D-010). Startup I/O
-  grows with the data size.
-- Flushes run in the foreground, inside the `Put` or `Delete` that finds
-  the memtable full.
-- Each SST holds at most 1,048,576 blocks and a 64 MiB index (B-006,
-  D-010). The default `memtable_bytes` cannot reach these limits. With
-  `memtable_bytes` above about 47.9 MiB and long keys, a flush can exceed
-  them; the database then stays readable but refuses mutations that need a
-  flush. Acknowledged data is not lost (docs/sst-format.md section 3.6).
-- A crash during the very first initialization can leave residue that
-  Open reports as `Corruption`. It needs manual cleanup or a fresh
-  directory.
-- M1 and M2 databases cannot be opened; there is no migration (D-009,
-  D-025).
-- Each open SST keeps its filter in memory (about 1.25 bytes per key at
-  the default). A filter-bearing SST holds at most 2^22 keys, so a single
-  flush of more keys fails without losing acknowledged data (D-029).
-- The benchmarks cover one parameter set with a warm page cache on a WSL2
-  virtual disk; they do not measure device I/O or cold reads.
-- One process and one calling thread. The lock is advisory. It does not
-  stop other processes from editing the directory.
-- Symbolic links are not followed: a symlinked database directory, `LOCK`,
-  or WAL is rejected (D-005). Only one directory level is created.
-- Untested failure cases are listed in the failure matrices above.
-- Once sequence numbers reach `UINT64_MAX`, further mutations are rejected
-  with `InvalidArgument` (D-006). The same applies when file IDs or
-  manifest generations run out (D-013).
+All 30 decisions, with alternatives and costs: [docs/decisions.md](docs/decisions.md).
+
+## Limitations
+- One process and one calling thread; the lock is advisory.
+- Flush and compaction run in the foreground inside the `Put` or `Delete` that triggers them, and every
+  compaction rewrites all live data.
+- Open reads every live SST in full to validate it, so startup I/O grows with the data size.
+- Recovery reads the whole active WAL into memory.
+- No range scans, snapshots, transactions or compression.
+- No migration from databases written by earlier engine versions (`v0.1-m1`, `v0.2-m2`); they are
+  rejected with `UnsupportedFormat` and left unchanged.
+- A crash during the very first initialization can leave residue that Open reports as `Corruption`; it
+  needs manual cleanup or a fresh directory.
+- Each open SST keeps its Bloom filter in memory (about 1.25 bytes per key at the default).
+- Symbolic links are never followed: a symlinked database directory, `LOCK` or WAL is rejected.
+- Per-SST and per-database size limits (block count, index size, filter keys, manifest entries) are
+  documented in [docs/sst-format.md](docs/sst-format.md) (sections 3.6, 3.7, 4 and 6); a flush or
+  compaction that would exceed them fails without losing acknowledged data.
 
 ## Layout
-
 ```
-src/core/      engine: codecs (WAL, SST, manifest, Bloom), memtable,
-               compaction merge, file names, POSIX file/directory/lock, DB
-src/testing/   header-only test helpers (temp dirs, independent WAL, SST,
-               and manifest builders, fault-injecting syscalls, crash
-               simulator)
+src/core/      engine: WAL, memtable, SST, Bloom filter, manifest, compaction, POSIX I/O, DB
+src/testing/   test-only helpers: independent WAL/SST/manifest builders, fault-injecting syscalls,
+               crash simulator
 tests/harness/ GoogleTest suites
 bench/         benchmark driver and recorded results
-scripts/       longer differential runs, benchmark runner and summary,
-               Bloom reference vectors
-docs/          design contract, format spec, M3 and M4 designs,
+scripts/       benchmark runner and summary, longer differential runs, Bloom reference vectors
+docs/          design, on-disk format, compaction and crash simulator, filters and benchmarks,
                decisions, bug log, failure matrix
 ```
+
+## References
+- LevelDB implementation notes: https://github.com/google/leveldb/blob/main/doc/impl.md
+- Linux `fsync(2)`: https://man7.org/linux/man-pages/man2/fsync.2.html
+
+## License
+MIT; see [LICENSE](LICENSE).
