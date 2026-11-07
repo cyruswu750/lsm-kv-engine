@@ -143,6 +143,9 @@ flush, including across reopens. WAL truncation cuts: 206.
 - Real power loss, device write caches, writeback reordering inside a
   file, torn sector writes, and media errors. The simulator models only
   the two crash models above.
+- Termination of a real OS process (for example SIGKILL of a separate
+  process running the engine). Process crashes are simulated in
+  `CrashSimSyscalls` (sim-P), not produced by killing a process.
 - Crash points outside the seven enumerated workloads, including crashes
   during a crash recovery, long or randomized crash workloads, and
   crashes combined with injected errors.

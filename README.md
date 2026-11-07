@@ -89,15 +89,16 @@ Guaranteed, under the filesystem's fsync contract:
   nothing is repaired or reconstructed from a directory listing.
 
 Not established: behavior under real power loss, device write caches, torn sector writes, writeback
-reordering within a file, or media errors. The crash simulator models only the two crash models above,
-and a reopen validates only what the filesystem returns.
+reordering within a file, or media errors; no test kills a real OS process. Process crashes and power
+loss are simulated by the crash simulator under the two models above, faults are injected as syscall
+results, and a reopen validates only what the filesystem returns.
 
 ## How correctness is tested
 
 | Technique | What it covers | Where |
 |---|---|---|
 | Byte-level truncation and mutation | the WAL cut at every byte (222 cuts), every SST byte truncated and bit-flipped, malformed manifests; never an unbounded allocation | `DBRecoveryTest.*`, `SstTest.*`, `Manifest.*` |
-| Syscall fault injection | EIO, ENOSPC, EINTR, short transfers and exceptions in flush and compaction publication (every syscall of flush steps F1–F5), cleanup and recovery reads; the publication fault tests assert that each injected fault was reached | `DBFaultTest.*`, `PublishFaultTest.*`, `CompactionFaultTest.*`, `UnsyncedManifestTest.*` |
+| Syscall fault injection | EIO, ENOSPC, EINTR, short transfers and exceptions in flush and compaction publication (each file open, write, fsync, close and rename of flush steps F1–F5 and both directory fsyncs), cleanup and recovery reads; the publication fault tests assert that each injected fault was reached | `DBFaultTest.*`, `PublishFaultTest.*`, `CompactionFaultTest.*`, `UnsyncedManifestTest.*` |
 | Crash simulator | 793 crash points × 2 models = 1,586 recoveries, judged by a response-aware oracle | `Workloads/CrashMatrixTest.*` |
 | Mutation check | a skipped SST fsync must be caught under simulated power loss and only there | `Workloads/CrashMutationTest.*` |
 | Differential testing | 8 workloads × 20 seeds × 5,000 operations with reopens, flushes, multi-output compactions and mixed filter versions | `Seeds/DifferentialTest.*` |
