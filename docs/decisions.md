@@ -1,9 +1,48 @@
 # Design Decisions
 
-Record decisions that affect correctness, durability, architecture,
-or measurable performance. Update validation status as tests are added.
+Decisions that affect correctness, durability, architecture, or measurable
+performance, in the order they were made, each with its alternatives, cost,
+and validating tests. IDs are stable; a decision replaced by a later one keeps
+its text and is marked here and in its entry. Engine versions are named by
+their release tags (M1 = `v0.1-m1` … M4 = `v0.4-m4`).
+
+| ID | Decision | Status |
+|---|---|---|
+| D-001 | Publish new WAL files through a temporary file | Active; the M1 file names it used were replaced by D-009 |
+| D-002 | Require recovery after a WAL sync failure | Active |
+| D-003 | Recognize interrupted initialization | Superseded by D-009 |
+| D-004 | Inject DB-level faults through an internal syscall seam | Active |
+| D-005 | Classify database entries with lstat and scan twice | Active |
+| D-006 | Report sequence exhaustion as InvalidArgument before I/O | Active |
+| D-007 | Read the whole WAL into memory during M1 recovery | Active |
+| D-008 | Replace the manifest as one whole-file record | Active |
+| D-009 | Separate M2 file names; reject M1 directories without migration | Active |
+| D-010 | SST layout with per-block checksums and full streaming validation at Open | Active |
+| D-011 | Open each SST per probe instead of holding descriptors | Active |
+| D-012 | Publication order and the separate cleanup error classes | Active |
+| D-013 | File-ID high-water mark, orphan retention, and counter exhaustion | Active |
+| D-014 | Extend the syscall seam to open, pread, fstat, rename, and unlink | Active |
+| D-015 | SST read errors during Get do not invalidate the handle | Active |
+| D-016 | Open syncs the database directory before retiring or acknowledging | Active |
+| D-017 | Full compaction of every live SST (M3) | Active |
+| D-018 | Compaction keeps the checkpoint and the active WAL (M3) | Active |
+| D-019 | Compaction errors follow the flush classification (M3) | Active |
+| D-020 | Mediate every filesystem call, plus named checkpoints (M3) | Active |
+| D-021 | A simulated crash freezes a snapshot and kills the instance (M3) | Active |
+| D-022 | Two crash models (M3) | Active |
+| D-023 | A response-aware recovery oracle (M3) | Active |
+| D-024 | Compaction output is one key-partitioned base run (M3) | Active |
+| D-025 | Manifest version 2 only; no M2 migration (M3) | Active |
+| D-026 | Trigger compaction by logical run count (M3) | Active |
+| D-027 | Bloom filters in SST version 2 (M4) | Active |
+| D-028 | A damaged filter fails Open (M4) | Active |
+| D-029 | Bounded filter memory (M4) | Active |
+| D-030 | Internal counters and benchmark-only switches (M4) | Active |
 
 ## D-001: Publish new WAL files through a temporary file
+
+Status: active. The principle applies to every WAL; the file names below are
+the M1 ones, replaced by `wal-<id>.log` in D-009 (sst-format.md section 8).
 
 - Decision: Write the header to `000001.wal.tmp`, fsync the file,
   rename it to `000001.wal`, then fsync the database directory.
@@ -35,6 +74,9 @@ or measurable performance. Update validation status as tests are added.
   recovers the prior state, optionally including the failed operation.
 
 ## D-003: Recognize interrupted initialization
+
+Status: superseded by D-009. Since M2, initialization residue without a
+MANIFEST is preserved as Corruption, and an M1 directory is UnsupportedFormat.
 
 - Decision: For M1, a directory containing only `LOCK` and the
   recognized initialization file `000001.wal.tmp` may be initialized

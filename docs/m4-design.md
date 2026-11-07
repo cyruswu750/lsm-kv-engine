@@ -1,9 +1,9 @@
-# M4 Design: Bloom Filters, Counters, and Benchmarks
+# Bloom Filters, Counters, and Benchmarks
 
-Status: specification of M4, which builds on M3 (docs/m3-design.md).
-The byte format is in docs/sst-format.md sections 3 and 3.7; design.md
-sections 9 and 11 are authoritative. M4 decisions are listed in section 7
-and are numbered D-027 onward in docs/decisions.md.
+Specification of the SST Bloom filters, the internal counters, and the
+benchmark protocol. The byte format is in sst-format.md sections 3 and
+3.7, the overall contract in design.md sections 9 and 11, and the
+decisions behind it are D-027 to D-030 in decisions.md.
 
 ## 1. Scope
 
@@ -141,20 +141,4 @@ header have passed their bounds; Open copies its bit array once, so the
 peak is 2B + 20 bytes, and B bytes stay resident per open SST (about
 bits_per_key / 8 bytes per key, 1.25 bytes at the default). Filterless
 (version 1) output has no key limit. Reducing the copies is possible but
-not done in M4.
-
-## 7. Decisions (D-027 onward in docs/decisions.md)
-
-- D-027 Bloom filters as SST version 2 with a fixed, self-specified hash
-  (FNV-1a 64 plus SplitMix64 finalizers, double hashing). Version 1 SSTs
-  stay readable; M2 databases are still rejected by the manifest
-  version.
-- D-028 Damaged filters fail Open: CRC, bounds, a key count different
-  from the SST's entries, or any stored key that the filter would deny.
-  A filter is never trusted as a negative answer without that check.
-- D-029 A per-SST key limit for filter-bearing SSTs (2^22) bounds both
-  builder and reader memory; compaction splits at it like at the block
-  and index limits.
-- D-030 Internal counters and benchmark-only switches (filter-query
-  bypass, sync bypass through the syscall seam) stay outside public
-  Options; the sync bypass exists only in the benchmark driver.
+not done.

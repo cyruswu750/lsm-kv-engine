@@ -1,13 +1,17 @@
 # On-Disk Format: SSTables, Manifest, and Directory Rules
 
-Status: the on-disk format implemented in `src/core/` as of M4. SSTs are
-version 1 (no filter, read only) or version 2 (with a Bloom filter,
-written since M4; section 3.7). The manifest is version 2 only (section
-4). It extends design.md sections 4, 5, 8, and 9. The WAL record encoding
-is unchanged from design.md section 6 (WAL v1); only WAL file names
-change. Where this document and design.md differ, design.md is
-authoritative. Section 13 records the differences that were resolved by
-updating design.md.
+The on-disk format implemented in `src/core/`: file names, SSTables,
+the manifest, sequence and counter rules, directory states, recovery,
+and the flush publication steps. SSTs are version 1 (no filter, read
+only) or version 2 (with a Bloom filter, the version written; section
+3.7). The manifest is version 2 only (section 4). The WAL record
+encoding is in design.md section 6; the engine-level contracts this
+format implements are in design.md sections 4, 5, 8 and 9.
+
+Compatibility statements name engine versions by their release tags: M1 is
+`v0.1-m1` (WAL only), M2 `v0.2-m2` (SSTs, manifest version 1), M3
+`v0.3-m3` (compaction, manifest version 2) and M4 `v0.4-m4` (SST version
+2 with Bloom filters).
 
 All integers are unsigned little-endian. Fields are serialized
 individually, never by dumping C++ structs. All checksums are standard
@@ -663,25 +667,3 @@ directory listing (`ListDirectory`), mkdir (`CreateDirectory`), and the
 open, flock, and close of `LOCK` (`LockFile`). The engine also reports
 named non-syscall boundaries through `PosixSyscalls::Checkpoint`
 (docs/m3-design.md section 2).
-
-## 13. Resolved differences from the earlier design.md text
-
-design.md section 8 was updated to state each of these choices.
-
-- One directory sync (F3) covers both the SST and the new-WAL renames.
-  No manifest refers to either file until that sync completes, so a
-  second sync would add an fsync without changing the durability order.
-- A regular `000001.wal.tmp` without MANIFEST is M1 residue (section 8,
-  row 6). M2 reports UnsupportedFormat and never removes it, unlike M1,
-  which removed it before initializing (design.md section 6).
-- Open syncs the directory once before removing orphans or exposing a
-  handle (section 9, step 6). The orphan removals themselves are not
-  synced, because a reappearing orphan is covered by the durable
-  high-water mark.
-- A read error or block corruption found by Get does not invalidate the
-  handle (section 11, decision D-015).
-- Compaction output is one base run of key-partitioned SSTs, compaction
-  is triggered by logical run count, and the manifest is version 2 only
-  (sections 4 and 4.1; design.md sections 8 and 9, updated for M3).
-- Bloom filters are carried by SST version 2 (section 3.7); design.md
-  section 9 states that version 1 SSTs stay readable (M4).

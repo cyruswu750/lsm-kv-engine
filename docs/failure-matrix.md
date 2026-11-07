@@ -1,15 +1,11 @@
-# Failure Matrix (M1-M4)
+# Failure Matrix
 
-Evidence: one fresh Debug ASan/UBSan acceptance run of the whole suite
-on the M4 code before it was committed: the M3 code plus the M4 changes,
-with test data on ext4. Result: 534/534 passing, none skipped or
-disabled, no sanitizer report. Every count below comes from that run.
-The committed code is that code with three comments corrected
-(`DB::Get` in src/core/db.cc, src/core/manifest.cc, and `wal_bytes` in
-src/core/db_internal.h); the documentation was edited after the run.
-The earlier runs (457/457 and 493/493 for M3, 531/531 for M4 before the
-pre-commit review added three tests) are historical and describe earlier
-trees.
+Which failure each test injects, what the engine must do, and the regression
+test that checks it. The counts in sections 2 to 4 are deterministic
+properties of the fixed workloads and seeds. They were recorded in a full
+Debug ASan/UBSan run on ext4 (534/534 tests, none skipped or disabled, no
+sanitizer report). CI reruns these workloads on every push to `main` and every pull request and checks their
+correctness properties; the exact counts in the tables are from that recorded run.
 
 Each row names the regression test that checks it.
 
@@ -46,7 +42,7 @@ power-loss behavior. Injected errors never model a lost page cache.
 | Flush cleanup F7 | errno | unlink failure and old-WAL close failure are not fatal; cleanup directory-sync failure is | pass | `PublishFaultTest.UnlinkFailureLeavesGarbageButKeepsTheHandle`, `OldWalCloseFailureIsNotFatal`, `CleanupDirectorySyncFailureRequiresRecovery` |
 | Visible but unsynced manifest at Open | errno | Open syncs the directory before retiring files or acknowledging; a failed sync retires nothing (B-005) | pass | `UnsyncedManifestTest.*` (2) |
 | SST reads at Open and Get | errno | Open fails with no handle; Get fails without invalidating | pass | `PublishFaultTest.SstReadFailureAtOpenExposesNoHandle`, `SstReadFailureDuringGetKeepsTheHandle` |
-| SST and manifest bytes | bytes | every truncation and bit flip fails closed; oversized indexes rejected before allocation (B-006) | pass | `SstTest.*` (18), `Manifest.*` (8), `ManifestFileTest.*` (2) |
+| SST and manifest bytes | bytes | every truncation and bit flip fails closed; oversized indexes rejected before allocation (B-006) | pass | `SstTest.*` (19), `Manifest.*` (8), `ManifestFileTest.*` (2) |
 | Missing or damaged referenced files | bytes | Corruption at Open | pass | `DBM2ReferenceTest.*` (4) |
 | Compaction C1-C6 (14 calls x EIO, ENOSPC) | errno | C1-C4 failures: IOError, NeedsRecovery, generation 3 recovered; C4 sync and C6 sync failures: generation 4; all acknowledged data recovered and later compactions succeed | pass | `CompactionFaultTest.EveryCompactionFailureRequiresRecovery` |
 | Compaction output write, manifest rename, input unlink | throw | NeedsRecovery; recovered generation 3, 3, 4 | pass | `CompactionFaultTest.ExceptionDuringCompactionRequiresRecovery` |
@@ -153,15 +149,15 @@ flush, including across reopens. WAL truncation cuts: 206.
 - Cross-directory renames, symbolic links, and FIFOs in the simulator
   (the engine never renames across directories; non-regular entries are
   covered on the real filesystem only).
-- Exceptions thrown from memtable Apply (M1 limitation), and
+- Exceptions thrown from memtable Apply, and
   cross-process lock behavior (only same-process Busy is tested).
 - A real writeback error that a later fsync hides (design.md section 5);
   reopen validates only what the filesystem returns.
 - The SST, file-ID, and manifest-entry limits at their real sizes
   (tested with lowered internal limits and crafted manifests only). A
-  flush larger than one SST is still rejected (the M2 B-006 case).
-- Migration of M2 databases: deliberately not supported (manifest
-  version 2 only).
+  flush larger than one SST is still rejected (the B-006 case).
+- Migration of databases written by earlier engine versions: deliberately
+  not supported (manifest version 2 only).
 - Compaction with a very large number of inputs (descriptor and memory
   use grow with the input count).
 - Concurrency (the engine is single-threaded by contract).

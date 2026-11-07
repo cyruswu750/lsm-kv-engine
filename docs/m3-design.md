@@ -1,14 +1,11 @@
-# M3 Design: Full Compaction and the Crash Simulator
+# Compaction and the Crash Simulator
 
-Status: specification of M3. It extends design.md sections 9 and 10
-and docs/sst-format.md. Where they differ, design.md is authoritative.
-design.md sections 8 and 9 state the owner-approved capacity policy of
-section 5 (a multi-SST base run, run-count triggering, manifest version 2
-only). SST v1, WAL v1, and the file names are unchanged.
-The manifest is version 2 only (sst-format.md section 4): M2 databases
-(manifest version 1) are deliberately unsupported, with no migration.
-Section 11 lists the M3 decisions; docs/decisions.md records them as
-D-017 to D-026.
+Specification of full compaction, the syscall seam it relies on, and the
+deterministic crash simulator with its recovery oracle. The overall
+contract is in design.md sections 8 to 10 and the byte formats in
+sst-format.md; the manifest is version 2 only (sst-format.md section 4),
+with no migration from manifest version 1. The decisions behind this
+design are D-017 to D-026 in decisions.md.
 
 ## 1. Scope
 
@@ -24,8 +21,8 @@ In scope:
   test-only) with separate volatile and durable state, crash enumeration,
   and a response-aware recovery oracle.
 
-Out of scope: Bloom filters, benchmarks (M4), leveled or partial
-compaction, background work, and any public Options change.
+Out of scope here: Bloom filters and benchmarks (m4-design.md), leveled
+or partial compaction, background work, and any public Options change.
 
 ## 2. Internal interfaces
 
@@ -206,7 +203,7 @@ pair is checked for a duplicate sequence). With the default trigger the input co
 database reopened with many SSTs (for example, built with compaction
 disabled) merges all of them at once.
 
-## 5. Capacity policy (owner-approved)
+## 5. Capacity policy
 
 B-006 limits one SST to 1,048,576 blocks and a 64 MiB index. With a
 single compaction output, those limits capped the whole database's live
@@ -214,7 +211,7 @@ data. Inputs that were each legal could merge into an output that was
 not, and the database then refused every mutation. With 64 KiB keys this
 happened at 1,023 live keys.
 
-The owner approved the following policy, implemented in M3:
+The policy:
 - Full compaction is kept. Every live SST is an input, so dropping
   winning tombstones stays safe (section 4).
 - The output is one base run of zero or more SSTs, split at key
@@ -241,10 +238,8 @@ Remaining limits, stated honestly:
 - Compaction rewrites all live data (full rewrite write amplification),
   and Open still reads every SST in full.
 
-History: until this policy, the branch failed such a compaction closed
-(InvalidArgument and NeedsRecovery, data intact, repeating after
-reopen). Section 5.1 of the earlier draft proposed the policy above; the
-owner approved it with the version 2 only boundary.
+Before this policy, such a compaction failed closed (InvalidArgument and
+NeedsRecovery, data intact, repeating after reopen).
 
 ## 6. Crash simulator
 
@@ -392,7 +387,7 @@ from M2).
 
 - M2 workloads that relied on SSTs accumulating use
   `compaction_trigger = 0` where their assertions count SSTs.
-- The approved format boundary changes version expectations. Manifest
+- The manifest format boundary changes version expectations. Manifest
   version 2 is now valid, and versions 1 and 3 are UnsupportedFormat
   (`Manifest.UnknownVersionIsUnsupportedFormat`,
   `DBM2Test.MalformedManifestIsNeverTreatedAsANewDatabase`). The test
@@ -401,35 +396,5 @@ from M2).
 - Manifest golden bytes are version 2 with a base run, recomputed by an
   independent script. The field and count cases follow the new run rules.
 - The interim test `DBM3Test.OutputOverTheSstLimitFailsClosedAndRepeats`
-  is replaced by the split tests: the approved policy splits the output
-  instead of failing.
-
-## 11. Decisions (to move into docs/decisions.md)
-
-- M3-D1 Full compaction of all live SSTs into one base run of
-  key-partitioned SSTs (zero or more), at an internal trigger on the
-  logical run count (default 4, minimum 2, 0 disables). Not in Options.
-  Cost: each compaction rewrites all live data.
-- M3-D2 Compaction keeps the checkpoint and active WAL, computes each
-  output's sequence bounds from its emitted entries, and allocates an ID
-  only per created output (C0 still requires one to be available).
-- M3-D3 Compaction errors follow the flush classification (section 4).
-- M3-D4 The full syscall seam (lstat, mkdir, directory listing, flock)
-  plus named non-syscall checkpoints. Production defaults are the real
-  syscalls; the checkpoint default is a no-op.
-- M3-D5 Simulator crash = snapshot + throw from a completed mutating
-  call or checkpoint; a dead instance fails every later call without
-  changing the snapshot.
-- M3-D6 Two models: process crash keeps volatile state; unsynced loss
-  keeps only durable contents reachable through durable entries.
-- M3-D7 Oracle accepts all acknowledged mutations plus optionally the
-  in-flight one, over the whole key set; initialization crashes follow
-  the directory state table.
-- M3-D8 Capacity (owner-approved, section 5): split outputs at key
-  boundaries within the per-SST limits; the output count is limited to
-  leave room for the flushes before the next compaction.
-- M3-D9 Manifest version 2 only, with `base_run_count`. Version 1 (M2)
-  and unknown versions are UnsupportedFormat with no file changed; no
-  migration or downgrade. Key ranges are derived at Open, not persisted.
-- M3-D10 Trigger by logical run count, so that a multi-SST base run is
-  not compacted again before new flushes, including after reopen.
+  is replaced by the split tests: the capacity policy (section 5) splits
+  the output instead of failing.
