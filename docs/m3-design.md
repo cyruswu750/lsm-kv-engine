@@ -383,12 +383,15 @@ concurrency, the capacity limits at their real sizes (tested with
 lowered internal limits), and a flush larger than one SST (unchanged
 from M2).
 
-## 10. Adapted earlier expectations
+## 10. Compatibility and test expectations
+
+How tests written for the earlier formats were adapted to compaction and manifest version 2.
+
 
 - M2 workloads that relied on SSTs accumulating use
   `compaction_trigger = 0` where their assertions count SSTs.
 - The manifest format boundary changes version expectations. Manifest
-  version 2 is now valid, and versions 1 and 3 are UnsupportedFormat
+  version 2 is the only valid version; versions 1 and 3 are UnsupportedFormat
   (`Manifest.UnknownVersionIsUnsupportedFormat`,
   `DBM2Test.MalformedManifestIsNeverTreatedAsANewDatabase`). The test
   builder writes version 2 by default; `version = 1` builds the M2
@@ -396,5 +399,5 @@ from M2).
 - Manifest golden bytes are version 2 with a base run, recomputed by an
   independent script. The field and count cases follow the new run rules.
 - The interim test `DBM3Test.OutputOverTheSstLimitFailsClosedAndRepeats`
-  is replaced by the split tests: the capacity policy (section 5) splits
+  was replaced by the split tests: the capacity policy (section 5) splits
   the output instead of failing.

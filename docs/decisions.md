@@ -50,13 +50,28 @@ the M1 ones, replaced by `wal-<id>.log` in D-009 (sst-format.md section 8).
 - Reason: An interrupted initialization should not leave a partially
   written header at the final WAL path, where it would be treated as
   database corruption.
-- Validation: Failures injected through the syscall seam (D-004) before
-  and after publication: `DBFaultTest.HeaderWriteFailureDuringInitialization`,
-  `DBFaultTest.TempFileSyncFailureDoesNotPublishWal`,
-  `DBFaultTest.DirectorySyncFailureAfterRenameExposesNoHandle`,
-  `DBFaultTest.ParentSyncFailureAfterCreatingDirectory`. Each reopen either
-  completes initialization or opens the published WAL. Planned: process
-  termination at named checkpoints; these tests do not model power loss.
+- Validation:
+  - Syscall results injected through the seam (D-004) at each
+    initialization step: `DBFaultTest.HeaderWriteFailureDuringInitialization`,
+    `DBFaultTest.TempFileSyncFailureDoesNotPublishWal`,
+    `DBFaultTest.DirectorySyncFailureAfterRenameExposesNoHandle`,
+    `DBFaultTest.ManifestDirectorySyncFailureExposesNoHandle`,
+    `DBFaultTest.ParentSyncFailureAfterCreatingDirectory` and
+    `PublishFaultTest.InitializationFaultsExposeNoHandle`. Open returns
+    the error with no handle, and the final WAL path never holds a partial
+    header. Under the current file rules (D-009), a reopen reports residue
+    left before the MANIFEST rename (a partial or unsynced temporary WAL,
+    or a published WAL without MANIFEST) as `Corruption` and preserves it;
+    after the MANIFEST rename it opens normally; if nothing but `LOCK` was
+    created (or, after a failed parent sync, nothing at all), the directory
+    is still uninitialized and a reopen with `create_if_missing` initializes
+    it. (Under the M1 rules, a reopen instead reinitialized or opened the
+    published WAL.)
+  - Simulated crashes: the crash simulator's `Init` workload (D-021,
+    D-022) stops the engine at every enumerated point of initialization
+    and recovers under the process-crash and the unsynced-state-loss
+    (simulated power-loss) models (`Workloads/CrashMatrixTest`).
+  - Not tested: termination of a real OS process and real power loss.
 
 ## D-002: Require recovery after a WAL sync failure
 
@@ -304,8 +319,9 @@ MANIFEST is preserved as Corruption, and an M1 directory is UnsupportedFormat.
   After a cleanup sync failure, the caller must reopen even though the
   published state is durable.
 - Validation: `PublishFaultTest.EveryPublicationFailureRequiresRecovery`
-  (every syscall of F1-F5, EIO and ENOSPC, each asserting that the
-  injected fault was reached),
+  (each file open, write, fsync, close and rename of F1-F5 and both
+  directory fsyncs, with EIO and ENOSPC, each asserting that the injected
+  fault was reached),
   `PublishFaultTest.ExceptionBeforeOrAfterDurablePublication`,
   `PublishFaultTest.UnlinkFailureLeavesGarbageButKeepsTheHandle`,
   `PublishFaultTest.OldWalCloseFailureIsNotFatal`,
